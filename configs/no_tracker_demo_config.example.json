@@ -1,0 +1,15 @@
+{
+  "gateways": [
+    {"name": "tello-1", "host": "192.168.50.101", "port": 10000},
+    {"name": "tello-2", "host": "192.168.50.102", "port": 10000},
+    {"name": "tello-3", "host": "192.168.50.103", "port": 10000}
+  ],
+  "pi_timeout_s": 15.0,
+  "rc_limit": 25,
+  "rate_hz": 10.0,
+  "log_dir": "logs/no_tracker_demos",
+  "notes": {
+    "purpose": "No-external-tracker communication and coordination basis demos",
+    "safety": "Only yaw/hover demos are provided. No horizontal motion is commanded."
+  }
+}

@@ -1,0 +1,1571 @@
+% main_with_raspi_network_integrated.tex
+% main_with_raspi_network.tex に外部計測なしデモ手順を統合した版
+% 追加実装「通常 Tello + Raspberry Pi ゲートウェイ構成」の導入手順書
+% 既存原稿へ章として取り込む場合は \documentclass〜\begin{document} を除き、\section 以降を貼り付けてください。
+
+\documentclass[uplatex,dvipdfmx,11pt]{jsarticle}
+
+\usepackage[top=25mm,bottom=25mm,left=22mm,right=22mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\lstdefinestyle{console}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  backgroundcolor=\color{gray!5},
+  keepspaces=true,
+  showstringspaces=false
+}
+\lstset{style=console}
+
+\title{通常 Tello + Raspberry Pi ゲートウェイ構成\ 追加実装手順書}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{目的}
+\label{sec:purpose}
+
+本手順書では，通常モデルの DJI Tello を複数台用いる協調取り囲み実験のために追加したソースコード群の導入手順をまとめる．通常 Tello は，各機体が Wi-Fi アクセスポイントとして動作し，Tello 側 IP アドレスが原則として各機体で同じ \texttt{192.168.10.1} になる．そのため，1 台の PC から複数の通常 Tello へ直接接続して制御する構成は取りにくい．
+
+そこで，Tello の台数分の Raspberry Pi を用意し，各 Raspberry Pi を 1 台の Tello 専用ゲートウェイとして使う．デスクトップ PC は有線 LAN で各 Raspberry Pi と通信し，各 Raspberry Pi は Wi-Fi で対応する Tello に接続する．PC 側は外部計測，安全シールド，目標スロット計算，方策またはベースライン制御を担当し，Raspberry Pi 側は Tello SDK コマンド送信を担当する．
+
+\section{追加ファイル構成}
+\label{sec:files}
+
+追加したファイル構成は次の通りである．
+
+\begin{lstlisting}
+tello_pi_gateway_patch/
+├── python/
+│   ├── run_real_baseline.py
+│   └── tello_rl/
+│       └── real/
+│           ├── __init__.py
+│           ├── pi_client.py
+│           ├── real_tracker.py
+│           ├── real_safety_shield.py
+│           └── real_tello_env.py
+├── raspberry_pi/
+│   └── tello_gateway.py
+├── configs/
+│   ├── pc_real_config.example.json
+│   ├── tracker_udp_schema.example.json
+│   └── pi_gateway_commands.txt
+└── README_source_files.md
+\end{lstlisting}
+
+各ファイルの役割を表 \ref{tab:file_roles} に示す．
+
+\begin{longtable}{p{0.32\linewidth}p{0.60\linewidth}}
+\caption{追加ファイルの役割}\label{tab:file_roles}\\
+\toprule
+ファイル & 役割 \\
+\midrule
+\endfirsthead
+\toprule
+ファイル & 役割 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{run\_real\_baseline.py} & 実機構成で PD ベースライン制御を実行する PC 側エントリ．学習済み方策を使う前の通信・外部計測・安全シールド確認に用いる． \\
+\texttt{pi\_client.py} & PC から各 Raspberry Pi の \texttt{tello\_gateway.py} へ TCP/JSON Lines で指令を送るクライアント． \\
+\texttt{real\_tracker.py} & 外部計測系から UDP JSON で送られてくる Tello と対象物の状態を受け取る． \\
+\texttt{real\_safety\_shield.py} & 実機用の安全シールド．機体間距離，壁距離，高度範囲，入力上限，計測欠落を監視する． \\
+\texttt{real\_tello\_env.py} & 既存の \texttt{MockEnv}/\texttt{UnityEnv} と同様の API を持つ実機環境ラッパ．将来的に学習済み方策を実機へ接続するための入口． \\
+\texttt{tello\_gateway.py} & Raspberry Pi 上で実行する Tello SDK ゲートウェイ．PC から受け取った正規化行動を \texttt{rc a b c d} へ変換して Tello に送る． \\
+\texttt{pc\_real\_config.example.json} & PC 側の実機構成設定例．Pi の IP，飛行領域，安全距離，制御ゲインなどを定義する． \\
+\texttt{tracker\_udp\_schema.example.json} & 外部計測系が PC へ送る UDP JSON の形式例． \\
+\texttt{pi\_gateway\_commands.txt} & Pi ゲートウェイに送れるメッセージ形式のメモ． \\
+\end{longtable}
+
+\section{前提条件}
+\label{sec:assumptions}
+
+本実装は，以下の前提で動作する．
+
+\begin{enumerate}[label=\arabic*.]
+  \item デスクトップ PC と全 Raspberry Pi は，同じ有線 LAN に接続されている．
+  \item 各 Raspberry Pi は，\texttt{wlan0} で対応する 1 台の Tello の Wi-Fi に接続する．
+  \item PC から Tello の \texttt{192.168.10.1} へは直接アクセスしない．PC は各 Raspberry Pi の有線 LAN 側 IP アドレスだけを扱う．
+  \item 外部計測系が存在し，Tello の水平位置，高度，yaw，対象物位置を PC に送信できる．
+  \item 初期実験では，学習済み方策ではなく PD ベースライン制御を用いる．
+  \item 実機飛行時は，安全ネット，十分な飛行領域，緊急停止手段，予備バッテリを用意する．
+\end{enumerate}
+
+
+\section{クイックスタート：外部計測なしデモの準備手順}
+\label{sec:quick_start_no_tracker}
+
+本節では，外部計測なしデモを実行する直前の準備手順を短くまとめる．詳細なネットワーク設定，SSH/SCP，Tello Wi-Fi 接続確認，および各デモの判定方法は後続の節で説明する．ここでは，3 台の Raspberry Pi の有線 LAN 側 IP を \texttt{192.168.50.101}，\texttt{192.168.50.102}，\texttt{192.168.50.103}，全 Raspberry Pi のユーザー名を \texttt{inulab} とする．
+
+\begin{enumerate}[label=\arabic*.]
+  \item メイン PC の PowerShell から，各 Raspberry Pi へ SSH 接続する．gateway は各 Raspberry Pi 上で常駐させるため，Pi の台数分の SSH 画面を開いておく．
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+ssh inulab@192.168.50.102
+ssh inulab@192.168.50.103
+\end{lstlisting}
+  各 SSH 画面で，Raspberry Pi 側の Python 仮想環境を有効化する．初回だけ \texttt{python3 -m venv ~/venv} を実行し，2 回目以降は \texttt{source ~/venv/bin/activate} だけでよい．
+\begin{lstlisting}
+python3 -m venv ~/venv      # 初回のみ
+source ~/venv/bin/activate
+python -m pip install --upgrade pip
+\end{lstlisting}
+
+  \item メイン PC 側の PowerShell で，\texttt{Tello-drone/python} に移動し，Python 仮想環境を有効化する．\texttt{Activate.ps1} が実行ポリシーで拒否される場合は，初回のみ \texttt{RemoteSigned} を \texttt{CurrentUser} スコープで許可する．
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+python -m venv venv
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+\end{lstlisting}
+  管理者権限や PC 全体の設定変更を避けたい場合は，その PowerShell セッションだけで次を実行してから仮想環境を有効化する．
+\begin{lstlisting}
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+
+  \item 3 台の Tello の電源を入れる．各 Raspberry Pi が対応する Tello Wi-Fi へ接続するまで少し待つ．各 SSH 画面で次を確認し，\texttt{TELLO-XXXXXX} と \texttt{192.168.10.1} への経路が見えることを確認する．
+\begin{lstlisting}
+iwgetid
+ip route get 192.168.10.1
+ping -c 3 192.168.10.1
+\end{lstlisting}
+
+  \item 各 Raspberry Pi の SSH 画面で gateway を起動する．Wi-Fi 接続が完了していない状態で起動すると \texttt{OSError: [Errno 101] Network is unreachable} になることがある．その場合は，\texttt{iwgetid} と \texttt{ip route get 192.168.10.1} を確認し，Tello Wi-Fi へ接続できてから同じコマンドを再実行する．
+\begin{lstlisting}
+source ~/venv/bin/activate
+python3 tello_gateway.py --listen-host 0.0.0.0 --listen-port 10000 --auto-command
+\end{lstlisting}
+  gateway が起動している SSH 画面ではプロンプトが戻らない．その画面は閉じずに残し，デモスクリプトはメイン PC 側の別 PowerShell から実行する．
+
+  \item メイン PC 側でデモスクリプトを実行する．まず非飛行の Demo 1 で通信を確認し，その後 Demo 2 の短時間 takeoff-hover-land へ進む．
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+.\venv\Scripts\Activate.ps1
+python .\no_tracker_demos\demo_01_comm_check.py --config ..\configs\no_tracker_demo_config.local.json --repeat 3
+python .\no_tracker_demos\demo_02_takeoff_hover_land.py --config ..\configs\no_tracker_demo_config.local.json --duration 8 --rate-hz 10 --yes
+\end{lstlisting}
+\end{enumerate}
+
+\section{ネットワーク構成}
+\label{sec:network}
+
+推奨するネットワーク構成を以下に示す．
+
+\begin{lstlisting}
+                 Ethernet LAN
+        +-------------------------+
+        |     switching hub        |
+        +-----+---------+---------+
+              |         |         
+        Desktop PC    Pi-1      Pi-2    ...    Pi-N
+      192.168.50.10   .101      .102           .10N
+                         |         |              |
+                       Wi-Fi     Wi-Fi          Wi-Fi
+                         |         |              |
+                      Tello-1   Tello-2  ...   Tello-N
+                    192.168.10.1 each
+\end{lstlisting}
+
+有線 LAN 側 IP アドレスの例を表 \ref{tab:ip_example} に示す．
+
+\begin{table}[h]
+  \centering
+  \caption{有線 LAN 側 IP アドレス設定例}
+  \label{tab:ip_example}
+  \begin{tabular}{lll}
+    \toprule
+    機器 & インターフェース & IP アドレス \\
+    \midrule
+    デスクトップ PC & Ethernet & \texttt{192.168.50.10/24} \\
+    Raspberry Pi 1 & eth0 & \texttt{192.168.50.101/24} \\
+    Raspberry Pi 2 & eth0 & \texttt{192.168.50.102/24} \\
+    Raspberry Pi 3 & eth0 & \texttt{192.168.50.103/24} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Raspberry Pi は IP ルータとしては使わない．したがって，IP forwarding や bridge 設定は不要である．Raspberry Pi は PC と Tello の間でアプリケーション層の変換を行うだけである．
+
+\section{Raspberry Pi 側の準備}
+\label{sec:pi_setup}
+
+\subsection{ファイル配置}
+
+各 Raspberry Pi に，次のファイルをコピーする．
+
+\begin{lstlisting}
+raspberry_pi/tello_gateway.py
+\end{lstlisting}
+
+例えば PC から Raspberry Pi へコピーする場合は次のようにする．
+
+\begin{lstlisting}
+scp raspberry_pi/tello_gateway.py inulab@192.168.50.101:~/tello_gateway.py
+\end{lstlisting}
+
+Pi が複数台ある場合は，各 Pi に同じ \texttt{tello\_gateway.py} をコピーする．Pi ごとの差分は，起動時の引数または接続先 Tello Wi-Fi の SSID で管理する．
+
+\subsection{Raspberry Pi 側 Python 仮想環境の準備}
+
+各 Raspberry Pi では，gateway 実行用の Python 仮想環境を用意してから \texttt{tello\_gateway.py} を起動する．仮想環境の作成は初回のみでよい．
+
+\begin{lstlisting}
+python3 -m venv ~/venv
+source ~/venv/bin/activate
+python -m pip install --upgrade pip
+\end{lstlisting}
+
+以降，SSH 接続し直した場合は，gateway を起動する前に次を実行して仮想環境を有効化する．
+
+\begin{lstlisting}
+source ~/venv/bin/activate
+\end{lstlisting}
+
+\subsection{有線 LAN 側 IP の固定}
+
+Raspberry Pi OS で NetworkManager を用いる場合，Pi-1 では次のように有線 LAN 側 IP を固定する．
+
+\begin{lstlisting}
+sudo nmcli con mod "Wired connection 1" ipv4.addresses 192.168.50.101/24
+sudo nmcli con mod "Wired connection 1" ipv4.method manual
+sudo nmcli con up "Wired connection 1"
+\end{lstlisting}
+
+Pi-2 では \texttt{192.168.50.102/24}，Pi-3 では \texttt{192.168.50.103/24} のように割り当てる．
+
+\subsection{Tello Wi-Fi への接続}
+
+各 Raspberry Pi の \texttt{wlan0} を，対応する Tello の Wi-Fi に接続する．
+
+\begin{lstlisting}
+sudo nmcli dev wifi rescan
+nmcli dev wifi list
+sudo nmcli dev wifi connect TELLO-XXXXXX ifname wlan0
+\end{lstlisting}
+
+接続後，Pi から Tello に到達できるか確認する．
+
+\begin{lstlisting}
+ping 192.168.10.1
+\end{lstlisting}
+
+\subsection{Pi ゲートウェイの起動}
+
+各 Raspberry Pi で \texttt{tello\_gateway.py} を起動する．初期確認では，\texttt{--auto-command} を付けて起動時に Tello SDK mode へ入るようにする．
+
+\begin{lstlisting}
+python3 ~/tello_gateway.py \
+  --listen-host 0.0.0.0 \
+  --listen-port 10000 \
+  --auto-command \
+  --rc-default-limit 30
+\end{lstlisting}
+
+安全確認中は \texttt{--rc-default-limit} を 20 から 30 程度に制限する．いきなり 100 にしない．
+
+
+\section{PC から Raspberry Pi へ SSH/SCP するためのネットワーク設定}
+\label{sec:ssh_scp_setup}
+
+本節では，PC から Raspberry Pi を遠隔操作するための SSH/SCP 設定をまとめる．本構成では，Raspberry Pi は Tello と Wi-Fi で 1 対 1 接続しつつ，PC とはスイッチングハブ経由の有線 LAN で接続される．したがって，PC から Raspberry Pi へ SSH する際は，Tello 側の Wi-Fi アドレスではなく，Raspberry Pi の有線 LAN 側 IP アドレスを指定する．
+
+\subsection{二つのネットワークを分離する考え方}
+
+Raspberry Pi は次の二つのネットワークに同時に参加する．
+
+\begin{lstlisting}
+eth0  または end0 : PC との制御・SSH・SCP 用
+wlan0             : Tello との SDK 通信用
+\end{lstlisting}
+
+たとえば Pi-1 では次のように設定する．
+
+\begin{lstlisting}
+PC Ethernet : 192.168.50.10/24
+Pi eth0     : 192.168.50.101/24
+Pi wlan0    : 192.168.10.x/24
+Tello       : 192.168.10.1
+\end{lstlisting}
+
+有線 LAN 側と Tello Wi-Fi 側を同じ \texttt{192.168.10.0/24} にしてはいけない．Tello は各機体で同じ \texttt{192.168.10.1} を使うため，有線 LAN 側は \texttt{192.168.50.0/24} などの別ネットワークに分ける．
+
+\subsection{PC 側 Ethernet の固定 IP 設定}
+
+Windows PC 側では，スイッチングハブに接続している Ethernet アダプタに固定 IP を設定する．
+
+\begin{lstlisting}
+IPアドレス        : 192.168.50.10
+サブネットマスク  : 255.255.255.0
+デフォルトゲートウェイ : 空欄
+DNS              : 空欄
+\end{lstlisting}
+
+スイッチングハブだけでは DHCP により IP アドレスは配布されないため，PC と Raspberry Pi の両方に固定 IP を設定する．PC 側の設定確認は PowerShell で次を実行する．
+
+\begin{lstlisting}
+ipconfig
+\end{lstlisting}
+
+\subsection{Raspberry Pi 側有線 LAN の固定 IP 設定}
+
+Raspberry Pi 側では，有線 LAN の接続名を確認する．Raspberry Pi の機種や OS により，インターフェース名は \texttt{eth0} ではなく \texttt{end0} になる場合がある．
+
+\begin{lstlisting}
+nmcli con show
+ip -br addr
+\end{lstlisting}
+
+有線接続名が \texttt{Wired connection 1} の場合，Pi-1 では次のように設定する．
+
+\begin{lstlisting}
+sudo nmcli con mod "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.50.101/24 \
+  ipv4.gateway "" \
+  ipv4.dns "" \
+  ipv6.method disabled
+
+sudo nmcli con up "Wired connection 1"
+\end{lstlisting}
+
+Pi-2 では \texttt{192.168.50.102/24}，Pi-3 では \texttt{192.168.50.103/24} のように，Pi ごとに異なる IP アドレスを割り当てる．設定後，次のような状態になっていることを確認する．
+
+\begin{lstlisting}
+ip -br addr
+
+# 期待例
+eth0   UP   192.168.50.101/24
+wlan0  UP   192.168.10.x/24
+\end{lstlisting}
+
+または，Raspberry Pi 5 などでは次のように表示されることがある．
+
+\begin{lstlisting}
+end0   UP   192.168.50.101/24
+wlan0  UP   192.168.10.x/24
+\end{lstlisting}
+
+\subsection{Tello Wi-Fi 接続時の注意}
+
+Raspberry Pi の Wi-Fi 側は，対応する Tello の SSID に接続する．このとき，Tello Wi-Fi をデフォルト経路として使わないようにするため，\texttt{ipv4.never-default yes} を設定しておくとよい．
+
+\begin{lstlisting}
+sudo nmcli dev wifi rescan
+nmcli dev wifi list
+
+sudo nmcli con add type wifi ifname wlan0 con-name tello1 ssid TELLO-XXXXXX
+sudo nmcli con mod tello1 ipv4.method auto ipv4.never-default yes ipv6.method disabled
+sudo nmcli con up tello1
+\end{lstlisting}
+
+接続後，Raspberry Pi から Tello に到達できることを確認する．
+
+\begin{lstlisting}
+ping 192.168.10.1
+\end{lstlisting}
+
+\subsection{SSH サーバの有効化}
+
+PC から SSH 接続するには，Raspberry Pi 側で SSH サーバが起動している必要がある．Raspberry Pi 上で次を実行する．
+
+\begin{lstlisting}
+sudo systemctl enable --now ssh
+sudo systemctl status ssh
+\end{lstlisting}
+
+SSH サーバが入っていない場合は，次でインストールする．
+
+\begin{lstlisting}
+sudo apt update
+sudo apt install -y openssh-server
+sudo systemctl enable --now ssh
+\end{lstlisting}
+
+22 番ポートで待ち受けているかは次で確認できる．
+
+\begin{lstlisting}
+sudo ss -tlnp | grep :22
+\end{lstlisting}
+
+\subsection{PC から SSH 接続する}
+
+PC の PowerShell から，有線 LAN 側 IP アドレスを指定して接続する．本実験で用いる Raspberry Pi のユーザー名は全台で \texttt{inulab} に統一しているため，SSH/SCP では \texttt{inulab@<Pi の有線 LAN 側 IP>} を指定する．
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+ssh inulab@192.168.50.102
+ssh inulab@192.168.50.103
+\end{lstlisting}
+
+ここで，\texttt{192.168.50.101}，\texttt{192.168.50.102}，\texttt{192.168.50.103} はそれぞれ Pi-1，Pi-2，Pi-3 の有線 LAN 側 IP アドレスである．プロンプトが \texttt{inulab@inulab-rpi-01:~ \$} のように表示される場合，\texttt{@} の前の \texttt{inulab} がユーザー名，\texttt{@} の後の \texttt{inulab-rpi-01} がホスト名である．
+
+ユーザー名を確認したい場合，Raspberry Pi にログイン済みの端末で次を実行する．
+
+\begin{lstlisting}
+whoami
+\end{lstlisting}
+
+本構成では，ここで \texttt{inulab} と表示されることを確認する．
+
+\subsection{SCP によるファイル転送}
+
+\texttt{scp} は SSH 経由でファイルを転送するコマンドである．PC から Raspberry Pi へファイルを送る場合は，PC 側の PowerShell で実行する．Raspberry Pi に SSH ログインした状態で Windows の \texttt{C:} ドライブを指定しても，Raspberry Pi から Windows のローカルファイルは見えない．
+
+PC から Pi-1 へ \texttt{tello\_gateway.py} を送る例を示す．
+
+\begin{lstlisting}
+scp .\tello_pi_gateway_patch\raspberry_pi\tello_gateway.py \
+  inulab@192.168.50.101:~/tello_gateway.py
+\end{lstlisting}
+
+絶対パスで指定する場合は次のようにする．
+
+\begin{lstlisting}
+scp "C:\Users\inulab\Work\Tello-drone\tello_pi_gateway_patch\raspberry_pi\tello_gateway.py" \
+  inulab@192.168.50.101:~/tello_gateway.py
+\end{lstlisting}
+
+転送後，SSH で Raspberry Pi に入り，ファイルが存在するか確認する．
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101 "ls -l ~/tello_gateway.py"
+\end{lstlisting}
+
+Raspberry Pi から PC へログを回収する場合は，PC 側 PowerShell で次のように実行する．
+
+\begin{lstlisting}
+scp inulab@192.168.50.101:/home/inulab/log.csv .\
+\end{lstlisting}
+
+\subsection{SSH/SCP の典型的なエラーと対処}
+
+\subsubsection{\texttt{ping} がタイムアウトする}
+
+\texttt{ping 192.168.50.101} がタイムアウトする場合は，SSH 以前に有線 LAN 通信が成立していない．次を確認する．
+
+\begin{itemize}
+  \item PC の Ethernet IP が \texttt{192.168.50.10/24} になっているか．
+  \item Raspberry Pi の有線 LAN IP が \texttt{192.168.50.101/24} になっているか．
+  \item PC と Pi が同じスイッチングハブに接続されているか．
+  \item LAN ケーブルまたはハブのリンクランプが点灯しているか．
+  \item Pi 側で \texttt{ip link} を実行したとき，有線インターフェースが \texttt{NO-CARRIER} になっていないか．
+\end{itemize}
+
+Pi 側の物理リンクは次で確認する．
+
+\begin{lstlisting}
+ip link
+\end{lstlisting}
+
+\texttt{LOWER\_UP} が表示されていれば物理リンクは成立している．\texttt{NO-CARRIER} の場合は，ケーブル，ハブ，ポート，電源を確認する．
+
+\subsubsection{\texttt{Connection refused}}
+
+\texttt{ssh: connect to host 192.168.50.101 port 22: Connection refused} と表示される場合，IP には到達しているが，Raspberry Pi 側で SSH サーバが起動していない可能性が高い．Pi 側で次を実行する．
+
+\begin{lstlisting}
+sudo systemctl enable --now ssh
+sudo systemctl status ssh
+\end{lstlisting}
+
+\subsubsection{\texttt{Could not resolve hostname c}}
+
+Raspberry Pi に SSH ログインした状態で次のようなコマンドを実行すると，\texttt{C:/Users/...} の \texttt{C:} がリモートホスト指定と解釈され，\texttt{Could not resolve hostname c} になる．
+
+\begin{lstlisting}
+scp "C:/Users/inulab/Work/.../tello_gateway.py" \
+  inulab@192.168.50.101:~/tello_gateway.py
+\end{lstlisting}
+
+PC 上のファイルを Pi に送る \texttt{scp} は，Raspberry Pi 上ではなく，Windows PowerShell 上で実行する．
+
+\subsubsection{\texttt{Permission denied}}
+
+\texttt{scp} または \texttt{ssh} で \texttt{Permission denied} になる場合は，ユーザー名またはパスワードが違う可能性が高い．本実験では Raspberry Pi のユーザー名を \texttt{inulab} に統一しているため，次の形式で接続する．
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+scp .\tello_pi_gateway_patch\raspberry_pi\tello_gateway.py \
+  inulab@192.168.50.101:~/tello_gateway.py
+\end{lstlisting}
+
+プロンプトが次のように表示される場合，\texttt{inulab} がユーザー名，\texttt{inulab-rpi-01} がホスト名である．ホスト名をユーザー名として指定しないように注意する．
+
+\begin{lstlisting}
+inulab@inulab-rpi-01:~ $
+\end{lstlisting}
+
+\subsection{推奨する確認順序}
+
+作業時は次の順に確認すると，問題を切り分けやすい．
+
+\begin{enumerate}[label=\arabic*.]
+  \item PC の Ethernet IP が \texttt{192.168.50.10/24} であることを確認する．
+  \item Raspberry Pi の有線 LAN IP が \texttt{192.168.50.101/24} であることを確認する．
+  \item Raspberry Pi の Wi-Fi が Tello に接続され，\texttt{wlan0} に \texttt{192.168.10.x/24} が付いていることを確認する．
+  \item PC から \texttt{ping 192.168.50.101} が通ることを確認する．
+  \item Raspberry Pi で SSH サーバが起動していることを確認する．
+  \item PC から \texttt{ssh inulab@192.168.50.101} でログインする．
+  \item PC の PowerShell から \texttt{scp} で必要なファイルを転送する．
+  \item Raspberry Pi 上で \texttt{ls -l} により転送されたファイルを確認する．
+\end{enumerate}
+
+\section{PC 側の準備}
+\label{sec:pc_setup}
+
+\subsection{ファイル配置}
+
+既存プロジェクトの Python ディレクトリに，追加ファイルをコピーする．既存構成が次のような場合を想定する．
+
+\begin{lstlisting}
+project_root/
+└── python/
+    ├── train.py
+    └── tello_rl/
+        ├── config.py
+        ├── formation.py
+        ├── observation.py
+        └── ...
+\end{lstlisting}
+
+ここに追加実装を次のように配置する．
+
+\begin{lstlisting}
+project_root/
+└── python/
+    ├── run_real_baseline.py
+    └── tello_rl/
+        └── real/
+            ├── __init__.py
+            ├── pi_client.py
+            ├── real_tracker.py
+            ├── real_safety_shield.py
+            └── real_tello_env.py
+\end{lstlisting}
+
+設定ファイルは，任意の場所に置いてよいが，以下では \texttt{project\_root/configs/} に置く例とする．
+
+\begin{lstlisting}
+project_root/
+└── configs/
+    ├── pc_real_config.example.json
+    ├── tracker_udp_schema.example.json
+    └── pi_gateway_commands.txt
+\end{lstlisting}
+
+\subsection{Python 仮想環境と PowerShell 実行ポリシー}
+
+メイン PC 側では，既存プロジェクトの \texttt{python/} ディレクトリで仮想環境を作成し，有効化してからデモスクリプトを実行する．Windows PowerShell で \texttt{Activate.ps1} の実行が拒否される場合は，ユーザー単位で \texttt{RemoteSigned} を許可する．
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+python -m venv venv
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+\end{lstlisting}
+
+すでに仮想環境を作成済みの場合，通常は次だけでよい．PowerShell のプロンプト先頭に \texttt{(venv)} が付けば有効化できている．
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+
+PC の実行ポリシーを恒久的に変更したくない場合は，現在の PowerShell セッションだけで一時的に許可してから有効化する．
+
+\begin{lstlisting}
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+
+\subsection{Python パスの確認}
+
+PC 側では，既存プロジェクトの \texttt{python/} ディレクトリで実行する．
+
+\begin{lstlisting}
+cd project_root/python
+python -c "import tello_rl; print('ok')"
+python -c "from tello_rl.real import PiSwarmClient; print('real ok')"
+\end{lstlisting}
+
+インポートに失敗する場合は，実行ディレクトリまたは \texttt{PYTHONPATH} を確認する．
+
+\begin{lstlisting}
+# 例: project_root/python を PYTHONPATH に追加
+export PYTHONPATH=$(pwd):$PYTHONPATH
+\end{lstlisting}
+
+Windows PowerShell の場合は次のようにする．
+
+\begin{lstlisting}
+$env:PYTHONPATH = (Get-Location).Path + ";" + $env:PYTHONPATH
+\end{lstlisting}
+
+\section{PC 側設定ファイル}
+\label{sec:pc_config}
+
+\texttt{pc\_real\_config.example.json} をコピーし，実験用に編集する．
+
+\begin{lstlisting}
+cp ../configs/pc_real_config.example.json ../configs/pc_real_config.local.json
+\end{lstlisting}
+
+主に編集する項目は次である．
+
+\begin{longtable}{p{0.32\linewidth}p{0.60\linewidth}}
+\caption{PC 側設定ファイルの主な項目}\label{tab:pc_config_items}\\
+\toprule
+項目 & 意味 \\
+\midrule
+\endfirsthead
+\toprule
+項目 & 意味 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{N} & Tello の台数．初期実験では 1，次に 2，最後に 3 と段階的に増やす． \\
+\texttt{dt} & 制御周期．初期値は 0.1 秒程度．実機では 5--10 Hz から始める． \\
+\texttt{pi\_gateways} & 各 Raspberry Pi の名前，IP，ポートを列挙する． \\
+\texttt{tracker} & 外部計測 UDP を受信するホストとポート． \\
+\texttt{area} & 飛行領域の $x,y,z$ 範囲．実験室の実寸に合わせる． \\
+\texttt{safety} & 機体間距離，壁距離，高度範囲，入力上限，計測タイムアウトなどの安全設定． \\
+\texttt{controller} & PD ベースラインのゲインや速度上限． \\
+\end{longtable}
+
+Pi の IP アドレスを実機環境に合わせて修正する．例を以下に示す．
+
+\begin{lstlisting}
+"pi_gateways": [
+  {"name": "tello_1", "host": "192.168.50.101", "port": 10000},
+  {"name": "tello_2", "host": "192.168.50.102", "port": 10000},
+  {"name": "tello_3", "host": "192.168.50.103", "port": 10000}
+]
+\end{lstlisting}
+
+\section{外部計測 UDP の形式}
+\label{sec:tracker_schema}
+
+PC 側の \texttt{real\_tracker.py} は，外部計測系から UDP JSON を受け取る．送信する JSON の基本形式は次の通りである．
+
+\begin{lstlisting}
+{
+  "t": 12.345,
+  "target": {
+    "r": [0.0, 0.0],
+    "v": [0.0, 0.0]
+  },
+  "drones": [
+    {"id": 0, "r": [0.9, 0.0], "h": 1.0, "yaw": 3.14},
+    {"id": 1, "r": [-0.45, 0.78], "h": 1.0, "yaw": -1.05},
+    {"id": 2, "r": [-0.45, -0.78], "h": 1.0, "yaw": 1.05}
+  ]
+}
+\end{lstlisting}
+
+ここで，\texttt{r} は水平面座標 $[x,y]$，\texttt{h} は高度，\texttt{yaw} はラジアン単位の yaw 角である．Unity 座標系や画像座標系から変換する場合は，PC 側へ送る前に実験座標系へ変換しておく．
+
+\section{実装後の確認手順}
+\label{sec:validation_steps}
+
+\subsection{Step 0: 構文チェック}
+
+まず，PC 側と Raspberry Pi 側の Python ファイルに構文エラーがないか確認する．
+
+\begin{lstlisting}
+# PC 側
+cd project_root/python
+python -m py_compile run_real_baseline.py
+python -m py_compile tello_rl/real/pi_client.py
+python -m py_compile tello_rl/real/real_tracker.py
+python -m py_compile tello_rl/real/real_safety_shield.py
+python -m py_compile tello_rl/real/real_tello_env.py
+
+# Raspberry Pi 側
+python3 -m py_compile ~/tello_gateway.py
+\end{lstlisting}
+
+\subsection{Step 1: Pi 単体で Tello SDK 通信確認}
+
+各 Pi で Tello Wi-Fi に接続し，ゲートウェイを起動する．PC から接続する前に，Pi 上で Tello に \texttt{command} が送られていること，バッテリ問い合わせができることを確認する．
+
+ゲートウェイが PC から \texttt{query} メッセージを受けられる場合，PC から次のようなメッセージを送る．
+
+\begin{lstlisting}
+{"type":"query","cmd":"battery?"}
+\end{lstlisting}
+
+応答が返れば，Pi--Tello 間の UDP 通信は成立している．
+
+\subsection{Step 2: PC から Pi への接続確認}
+
+PC から各 Raspberry Pi へ TCP 接続できるか確認する．
+
+\begin{lstlisting}
+ping 192.168.50.101
+ping 192.168.50.102
+ping 192.168.50.103
+\end{lstlisting}
+
+次に，PC 側プログラムから各 Pi へ \texttt{rc 0 0 0 0} 相当のメッセージを送り，ゲートウェイ側ログに受信が出ることを確認する．この段階では，Tello を離陸させない．
+
+\subsection{Step 3: 外部計測のみの確認}
+
+Tello を飛ばさず，外部計測系が UDP JSON を PC へ送信しているか確認する．PC 側の \texttt{real\_tracker.py} が受信できる形式になっていることを確認する．
+
+チェックすべき点は次である．
+
+\begin{itemize}
+  \item Tello の個体 ID と \texttt{drones} 配列の ID が一致している．
+  \item 単位が m と rad になっている．
+  \item 座標系の $x,y$ 軸向きが，制御で使う座標系と一致している．
+  \item yaw 角の正方向が，Tello の前方方向と一致している．
+  \item UDP 更新周期が制御周期より十分速いか，少なくとも同程度である．
+\end{itemize}
+
+\subsection{Step 4: PC 側ベースラインを dry run する}
+
+\texttt{--takeoff} を付けずに PC 側ベースラインを実行する．この段階では，制御計算，外部計測受信，Pi への接続だけを確認する．
+
+\begin{lstlisting}
+cd project_root/python
+python run_real_baseline.py \
+  --config ../configs/pc_real_config.local.json \
+  --duration 20
+\end{lstlisting}
+
+ログ上で，次を確認する．
+
+\begin{itemize}
+  \item 各 Tello の計測値が更新されている．
+  \item 目標スロットが飛行領域内にある．
+  \item 安全シールドが異常な補正を連発していない．
+  \item Pi への送信が成功している．
+\end{itemize}
+
+\subsection{Step 5: 単機 takeoff/land 確認}
+
+最初は $N=1$ に設定し，Tello 1 台だけで確認する．外部計測が正常に入っている状態で，PC 側から \texttt{takeoff} と \texttt{land} を行う．
+
+\begin{lstlisting}
+python run_real_baseline.py \
+  --config ../configs/pc_real_config.local.json \
+  --duration 10 \
+  --takeoff
+\end{lstlisting}
+
+この段階では，制御入力を小さくし，必要であれば目標位置を現在位置付近に置く．正常に離陸し，ホバリングし，着陸できることを確認する．
+
+\subsection{Step 6: 単機位置制御}
+
+次に，単機で目標位置への PD 制御を確認する．初期設定では，速度上限と RC 上限を低くする．
+
+\begin{itemize}
+  \item \texttt{rc\_limit}: 20--30
+  \item 水平速度上限: 0.2--0.3 m/s
+  \item 高度目標: 0.8--1.0 m
+  \item 制御周期: 0.1--0.2 s
+\end{itemize}
+
+機体が目標位置と逆方向に動く場合は，座標系または yaw 角の符号が合っていない．左右，前後，yaw の符号を単機で再確認する．
+
+\subsection{Step 7: 複数機の固定位置制御}
+
+単機で安定した後，$N=2$，次に $N=3$ へ増やす．この段階では対象物取り囲みではなく，各機体に十分離れた固定目標位置を与える．安全距離を大きめに設定し，機体間距離が保たれることを確認する．
+
+\subsection{Step 8: 静止対象物の正多角形取り囲み}
+
+$N=3$，対象物静止，Case 1 の正多角形配置を用いる．取り囲み半径 $R$ は 0.9 m 程度から始める．初期実験では，対象物を床上の固定マーカーとし，外部計測系が対象物位置 $r_o$ を送信する．
+
+評価するログ項目は次である．
+
+\begin{itemize}
+  \item slot 誤差 $\|r_i-r_i^{\rm slot}\|$
+  \item 対象物からの半径誤差
+  \item 機体間距離
+  \item 壁距離
+  \item 高度誤差
+  \item safety shield の補正回数
+  \item Pi との通信遅延
+\end{itemize}
+
+\subsection{Step 9: 移動対象物追従}
+
+静止対象物で安定してから，対象物を低速で動かす．対象物速度は最初は 0.05--0.1 m/s 程度に制限する．急な折れ線軌道や円軌道は，静止対象物と等速直線追従が安定してから行う．
+
+\subsection{Step 10: 学習済み方策への置き換え}
+
+PD または NSB ベースラインで安全性を確認した後，学習済み方策を \texttt{RealTelloEnv} に接続する．このときも，安全シールドは無効化しない．最初は探索ノイズを切り，方策の平均 action のみを用いる．RC 上限も低い値から始める．
+
+\section{安全確認チェックリスト}
+\label{sec:safety_checklist}
+
+実機飛行前に，以下を確認する．
+
+\begin{enumerate}[label=\arabic*.]
+  \item 各 Raspberry Pi から対応する Tello にだけ接続されている．
+  \item PC から各 Raspberry Pi に ping が通る．
+  \item 外部計測系が全 Tello と対象物を認識している．
+  \item Tello ID と Pi ID と外部計測 ID の対応が一致している．
+  \item 座標系の $x,y$ 軸，yaw 正方向，Tello 前方方向が一致している．
+  \item PC 側安全シールドが有効である．
+  \item Pi 側 watchdog が有効である．
+  \item PC 側プログラムを停止した場合に，Pi が \texttt{rc 0 0 0 0} または \texttt{land} を送る．
+  \item \texttt{emergency} を送る方法が確認されている．
+  \item バッテリ残量が十分である．
+  \item 飛行領域に人や壊れやすい物がない．
+  \item 初回は必ず低い RC 上限で実行する．
+\end{enumerate}
+
+\section{トラブルシューティング}
+\label{sec:troubleshooting}
+
+\subsection{PC から Pi に接続できない}
+
+次を確認する．
+
+\begin{itemize}
+  \item Pi の有線 LAN 側 IP が設定通りか．
+  \item PC と Pi が同じサブネットにいるか．
+  \item \texttt{tello\_gateway.py} が起動しているか．
+  \item ファイアウォールが TCP ポート \texttt{10000} をブロックしていないか．
+\end{itemize}
+
+\subsection{Pi から Tello に接続できない}
+
+次を確認する．
+
+\begin{itemize}
+  \item Pi の \texttt{wlan0} が正しい Tello SSID に接続されているか．
+  \item \texttt{ping 192.168.10.1} が通るか．
+  \item 他の端末が同じ Tello Wi-Fi に接続していないか．
+  \item Tello のバッテリが十分か．
+\end{itemize}
+
+\subsection{Tello が逆方向に動く}
+
+座標系または符号規約の問題である可能性が高い．単機で次を確認する．
+
+\begin{itemize}
+  \item \texttt{rc 0 20 0 0} で機体が前方へ動くか．
+  \item \texttt{rc 20 0 0 0} で左右のどちらへ動くか．
+  \item yaw 角が増える方向と画像処理で推定した yaw の正方向が一致しているか．
+  \item 世界座標速度から機体座標速度への変換式が正しいか．
+\end{itemize}
+
+\subsection{安全シールドが常に停止を返す}
+
+次を確認する．
+
+\begin{itemize}
+  \item 外部計測の座標単位が cm ではなく m になっているか．
+  \item 飛行領域設定 \texttt{area} が実験室座標と一致しているか．
+  \item 高度 $h$ の値が正しく入っているか．
+  \item Tello ID と計測 ID が入れ替わっていないか．
+  \item tracker timeout が短すぎないか．
+\end{itemize}
+
+\section{実験ログの保存項目}
+\label{sec:logs}
+
+実機実験では，既存の目的コスト・制約コスト・取り囲み誤差に加えて，通信系と安全系のログを保存する．最低限保存すべき項目は次である．
+
+\begin{itemize}
+  \item 制御ステップ $k$ と時刻 $t$．
+  \item 各 Tello の位置 $r_i$，高度 $h_i$，yaw 角 $\psi_i$．
+  \item 対象物位置 $r_o$，対象物速度 $v_o$．
+  \item 目標スロット $r_i^{\rm slot}$．
+  \item raw action $\tilde a_i$．
+  \item executed action $a_i$．
+  \item 実際に送信した RC 値．
+  \item 安全シールドが action を補正した理由．
+  \item 各 Pi への送信成功・失敗．
+  \item PC--Pi 間通信遅延．
+  \item Tello のバッテリ残量．
+  \item 外部計測の最終更新時刻．
+  \item watchdog 発火の有無．
+\end{itemize}
+
+\section{既存学習コードとの接続方針}
+\label{sec:connection_to_existing_rl}
+
+追加実装のうち，\texttt{real\_tello\_env.py} は，既存の \texttt{MockEnv} や \texttt{UnityEnv} と同じ形式の API を提供することを目的としている．すなわち，外部からは次のように扱う．
+
+\begin{lstlisting}
+obs = env.reset()
+obs, obj, con, exe, done, info = env.step(raw_actions)
+\end{lstlisting}
+
+ただし，実機環境では，\texttt{step} の中で数値モデルを前進させるのではなく，次を行う．
+
+\begin{enumerate}[label=\arabic*.]
+  \item raw action を安全シールドに通す．
+  \item executed action を各 Raspberry Pi へ送る．
+  \item 次の制御周期まで待つ．
+  \item 外部計測から実状態を取得する．
+  \item 観測，目的コスト，制約コストを計算して返す．
+\end{enumerate}
+
+このため，学習済み方策の実機評価は可能であるが，実機上でオンライン学習を行う場合は，安全性，試行回数，バッテリ，計測欠落時の扱いを別途慎重に設計する必要がある．初期段階では，シミュレーションまたは Unity で学習した方策を，実機では評価のみ行う構成が望ましい．
+
+\section{外部計測なしで行う Tello--Raspberry Pi 協調制御基盤確認デモ}
+\label{sec:no_tracker_demo}
+
+この節では，外部計測系を導入する前の段階で，3 台の通常 Tello，3 台の Raspberry Pi，およびメイン PC が通信し，協調制御用の指令配信基盤として動作することを確認するデモ手順をまとめる．本デモは，対象物取り囲み制御そのものの検証ではなく，通信，周期指令，役割別 action 配信，watchdog，ログ保存を確認するための準備段階である．
+
+\subsection{目的}
+
+本書は，外部計測系を導入する前の段階で，3 台の通常 Tello，3 台の Raspberry Pi，およびメイン PC が通信し，協調制御用の指令配信基盤として動作することを確認するためのデモ手順をまとめる．
+
+ここで確認するのは，対象物取り囲み制御そのものではない．外部計測なしでは，各 Tello の水平面位置，機体間距離，対象物位置を十分な精度で得られないため，取り囲み誤差や安全距離維持を実証することはできない．本書のデモは，以下を確認するための準備段階である．
+
+\begin{itemize}
+  \item メイン PC から 3 台の Raspberry Pi へ TCP 接続できること．
+  \item 各 Raspberry Pi が対応する Tello に SDK コマンドを送れること．
+  \item 3 台分の Tello から \texttt{ok}，\texttt{battery?} 応答，状態値を取得できること．
+  \item メイン PC が 3 台へ周期的に \texttt{rc} 指令を送れること．
+  \item 3 台に異なる役割を割り当て，yaw のみで安全寄りの同期動作を実行できること．
+  \item 仮想的な合意計算・イベントトリガ計算の結果を，実機への役割別コマンドに反映できること．
+  \item 各ステップの通信ログを JSONL 形式で保存できること．
+\end{itemize}
+
+\subsection{前提構成}
+
+本デモでは，通常 Tello の通信制約を避けるため，各 Tello に 1 台ずつ Raspberry Pi を対応させる．各 Raspberry Pi は，有線 LAN 側でメイン PC と通信し，無線 LAN 側で対応する Tello の Wi-Fi に接続する．
+
+\begin{lstlisting}
+                 Ethernet LAN
+        +-------------------------+
+        |     switching hub        |
+        +-----+---------+---------+
+              |         |
+        Main PC      Pi-1      Pi-2      Pi-3
+      192.168.50.10 .101      .102      .103
+                       |         |         |
+                     Wi-Fi     Wi-Fi     Wi-Fi
+                       |         |         |
+                    Tello-1   Tello-2   Tello-3
+                  192.168.10.1 each
+\end{lstlisting}
+
+重要な点は，Tello 側の \texttt{192.168.10.1} をメイン PC 側へルーティングしないことである．メイン PC は，各 Raspberry Pi の有線 LAN 側 IP アドレスだけを相手にし，Raspberry Pi がアプリケーション層ゲートウェイとして Tello SDK コマンドを送信する．
+
+\subsection{追加ファイル構成}
+
+本書に対応する追加ファイルは次の通りである．Raspberry Pi 側は，既に作成した \texttt{tello\_gateway.py} をそのまま使う．今回追加するのは主にメイン PC 側のデモスクリプトである．
+
+\begin{lstlisting}
+tello_no_tracker_demo_patch/
+  python/
+    no_tracker_demos/
+      no_tracker_common.py
+      demo_01_comm_check.py
+      demo_02_takeoff_hover_land.py
+      demo_03_sync_yaw_roles.py
+      demo_04_virtual_event_demo.py
+  configs/
+    no_tracker_demo_config.example.json
+    run_commands.md
+  docs/
+    tello_no_tracker_demo_steps.tex
+  README_no_tracker_demos.md
+\end{lstlisting}
+
+各ファイルの役割を表 \ref{tab:demo_files} に示す．
+
+\begin{longtable}{p{0.33\linewidth}p{0.60\linewidth}}
+\caption{外部計測なしデモ用ファイル} \label{tab:demo_files} \\
+\toprule
+ファイル & 役割 \\
+\midrule
+\endfirsthead
+\toprule
+ファイル & 役割 \\
+\midrule
+\endhead
+\texttt{no\_tracker\_common.py} & 各デモ共通の TCP クライアント，JSONL ロガー，並列送信，安全確認，\texttt{land} 処理をまとめた共通モジュール． \\
+\texttt{demo\_01\_comm\_check.py} & 非飛行の通信確認デモ．\texttt{command}，\texttt{battery?}，\texttt{status} を 3 台同時に確認する． \\
+\texttt{demo\_02\_takeoff\_hover\_land.py} & 3 機同時の \texttt{takeoff}，周期的な \texttt{rc 0 0 0 0}，\texttt{land} を確認する．水平移動は行わない． \\
+\texttt{demo\_03\_sync\_yaw\_roles.py} & 3 機に異なる yaw 役割を与える同期デモ．水平移動なしで，役割別 action 配信を確認する． \\
+\texttt{demo\_04\_virtual\_event\_demo.py} & メイン PC 内で仮想合意・イベントトリガ計算を行い，イベント発火を yaw pulse として反映するデモ．デフォルトでは非飛行 dry-run． \\
+\texttt{no\_tracker\_demo\_config.example.json} & Raspberry Pi の IP アドレス，ポート，RC 上限，ログ保存先の設定例． \\
+\texttt{run\_commands.md} & 代表的な実行コマンド一覧． \\
+\bottomrule
+\end{longtable}
+
+\subsection{Raspberry Pi 側の準備}
+
+各 Raspberry Pi で，対応する Tello の Wi-Fi に接続してから，前回作成したゲートウェイを起動する．例を以下に示す．
+
+\begin{lstlisting}
+python3 tello_gateway.py \
+  --listen-host 0.0.0.0 \
+  --listen-port 10000 \
+  --auto-command \
+  --rc-default-limit 25
+\end{lstlisting}
+
+各 Raspberry Pi の有線 LAN 側 IP は，設定ファイル \texttt{no\_tracker\_demo\_config.example.json} と一致させる．例を以下に示す．
+
+\begin{lstlisting}
+Pi-1: 192.168.50.101
+Pi-2: 192.168.50.102
+Pi-3: 192.168.50.103
+\end{lstlisting}
+
+Raspberry Pi 側では，メイン PC から一定時間 \texttt{rc} 指令が来ない場合，watchdog により \texttt{rc 0 0 0 0} または \texttt{land} を送る．そのため，飛行デモ中はメイン PC 側が周期的に \texttt{rc} を送り続ける．
+
+\subsection{メイン PC 側の設定}
+
+メイン PC 側では，\texttt{configs/no\_tracker\_demo\_config.example.json} を実験環境に合わせて編集する．
+
+\begin{lstlisting}[language={}]
+{
+  "gateways": [
+    {"name": "tello-1", "host": "192.168.50.101", "port": 10000},
+    {"name": "tello-2", "host": "192.168.50.102", "port": 10000},
+    {"name": "tello-3", "host": "192.168.50.103", "port": 10000}
+  ],
+  "pi_timeout_s": 1.0,
+  "rc_limit": 25,
+  "rate_hz": 10.0,
+  "log_dir": "logs/no_tracker_demos"
+}
+\end{lstlisting}
+
+最初は \texttt{rc\_limit=25} 程度の低い値から始める．本書の飛行デモでは水平移動成分 \texttt{lr, fb} は常に 0 とし，必要な場合も yaw のみを使う．
+
+\subsection{安全上の注意}
+
+外部計測なしでは，機体間距離と壁距離を自動的に監視できない．したがって，本デモでは次の条件を満たす場合だけ飛行デモを行う．
+
+\begin{itemize}
+  \item プロペラガードを装着する．
+  \item 3 台の Tello を十分に離して配置する．
+  \item 水平移動を行わない．
+  \item 最初は \texttt{takeoff-hover-land} のみを行う．
+  \item yaw デモでは \texttt{yaw\_norm} と \texttt{rc\_limit} を小さくする．
+  \item 飛行領域に人の手や顔を近づけない．
+  \item 異常時はすぐにプログラムを停止し，必要なら全機 \texttt{land} または \texttt{emergency} を送る．
+\end{itemize}
+
+本デモの Python スクリプトは，飛行を伴う場合，通常は対話的に \texttt{YES} 入力を求める．自動実行したい場合だけ \texttt{--yes} を付ける．
+
+\subsection{Demo 1: 非飛行・通信確認デモ}
+
+\subsubsection{目的}
+
+Demo 1 は，プロペラを回さずに，以下の通信経路を確認する．
+
+\begin{lstlisting}
+Main PC -> Pi-i -> Tello-i -> Pi-i -> Main PC
+\end{lstlisting}
+
+確認項目は次の通りである．
+
+\begin{itemize}
+  \item メイン PC から各 Raspberry Pi に TCP 接続できる．
+  \item 各 Raspberry Pi が対応する Tello に \texttt{command} を送れる．
+  \item 各 Tello から \texttt{battery?} 応答が返る．
+  \item 各 Raspberry Pi の gateway 状態を \texttt{status} で取得できる．
+  \item 3 台分の応答時間と結果を JSONL ログに保存できる．
+\end{itemize}
+
+\subsubsection{実行コマンド}
+
+\begin{lstlisting}
+cd tello_no_tracker_demo_patch/python/no_tracker_demos
+python demo_01_comm_check.py \
+  --config ../../configs/no_tracker_demo_config.example.json \
+  --repeat 3
+\end{lstlisting}
+
+\subsubsection{成功条件}
+
+各 Tello について，\texttt{command\_all}，\texttt{battery\_all}，\texttt{status\_all} がすべて \texttt{ok} になることを確認する．この段階では飛行しないため，最初に必ず実施する．
+
+\subsection{Demo 2: 3 機同時 takeoff-hover-land デモ}
+
+\subsubsection{目的}
+
+Demo 2 は，3 台の Tello が同時に \texttt{takeoff} し，メイン PC から周期的に \texttt{rc 0 0 0 0} を受け取り，最後に \texttt{land} できることを確認する．外部計測がないため，水平移動は行わない．
+
+このデモで確認できるのは，以下である．
+
+\begin{itemize}
+  \item 3 台へほぼ同時に \texttt{takeoff} を送れる．
+  \item メイン PC が 3 台へ周期的に \texttt{rc} 指令を送れる．
+  \item Raspberry Pi 側 watchdog と衝突せずに，メイン PC から keep-alive 的に \texttt{rc 0 0 0 0} を送り続けられる．
+  \item 最後に全機へ \texttt{land} を送れる．
+\end{itemize}
+
+\subsubsection{実行コマンド}
+
+\begin{lstlisting}
+cd tello_no_tracker_demo_patch/python/no_tracker_demos
+python demo_02_takeoff_hover_land.py \
+  --config ../../configs/no_tracker_demo_config.example.json \
+  --duration 8 \
+  --rate-hz 10 \
+  --yes
+\end{lstlisting}
+
+\subsubsection{処理の流れ}
+
+\begin{enumerate}
+  \item 3 台の Raspberry Pi へ TCP 接続する．
+  \item 3 台へ \texttt{command} を送る．
+  \item 3 台へ \texttt{battery?} を送り，応答を確認する．
+  \item 3 台へ \texttt{takeoff} を送る．
+  \item 数秒待って，離陸直後の安定化を待つ．
+  \item 指定時間だけ \texttt{rc 0 0 0 0} を周期送信する．
+  \item 最後に 3 台へ \texttt{land} を送る．
+\end{enumerate}
+
+\subsubsection{成功条件}
+
+すべての Tello が離陸し，水平移動せずホバリングし，最後に正常に着陸すれば成功である．ただし，Tello の内部制御や床面条件により多少のドリフトはあり得るため，十分な間隔を確保して行う．
+
+\subsection{Demo 3: 役割付き同期 yaw デモ}
+
+\subsubsection{目的}
+
+Demo 3 は，3 台の Tello に異なる役割を割り当て，メイン PC が各機へ別々の action を周期配信できることを確認する．外部計測なしで水平移動は危険なため，yaw のみを使う．
+
+例として，3 台に次の役割を与える．
+
+\begin{lstlisting}
+Tello-1: yaw positive
+Tello-2: yaw negative
+Tello-3: hover
+\end{lstlisting}
+
+\subsubsection{実行コマンド}
+
+\begin{lstlisting}
+cd tello_no_tracker_demo_patch/python/no_tracker_demos
+python demo_03_sync_yaw_roles.py \
+  --config ../../configs/no_tracker_demo_config.example.json \
+  --duration 10 \
+  --yaw-norm 0.20 \
+  --rate-hz 10 \
+  --yes
+\end{lstlisting}
+
+\subsubsection{action の意味}
+
+各 action は
+
+\begin{lstlisting}
+[lr, fb, ud, yaw]
+\end{lstlisting}
+
+であり，Demo 3 では \texttt{lr=0, fb=0, ud=0} とする．したがって，水平移動は指令しない．たとえば \texttt{rc\_limit=25}，\texttt{yaw\_norm=0.20} の場合，yaw チャンネルにはおおよそ \texttt{5} または \texttt{-5} が送られる．
+
+\subsubsection{成功条件}
+
+3 台が同時に離陸し，Tello-1 と Tello-2 が反対向きにゆっくり yaw 回転し，Tello-3 が hover することを確認する．このとき，ログには各 Tello へ送った action と gateway から返った \texttt{rc} コマンドが保存される．
+
+\subsection{Demo 4: 仮想イベントトリガ協調デモ}
+
+\subsubsection{目的}
+
+Demo 4 は，外部計測なしでも，メイン PC 内で合意計算・イベントトリガ判定を行い，その結果を Tello への役割別 action として配信できることを確認する．
+
+このデモでは，実 Tello の位置を使わない．代わりに，メイン PC 内に仮想的な状態 \(\theta_i\) を持ち，リング近傍の合意更新に近い計算を行う．最後に送信した値 \(\hat{\theta}_i\) との差がしきい値を超えたときだけ，イベント発火とみなす．
+
+\begin{lstlisting}
+if |theta_i - theta_hat_i| >= epsilon_q:
+    event_i = true
+    theta_hat_i <- theta_i
+else:
+    event_i = false
+\end{lstlisting}
+
+イベントが発火した機体には短い yaw pulse を与え，発火しなかった機体は hover する．このデモは，方策・合意・イベントトリガ通信の流れを実機コマンド配信経路に接続するための準備である．
+
+\subsubsection{非飛行 dry-run}
+
+まずは非飛行で実行する．この場合，\texttt{takeoff} も \texttt{rc} 送信も行わず，仮想計算とログ保存だけを確認する．
+
+\begin{lstlisting}
+cd tello_no_tracker_demo_patch/python/no_tracker_demos
+python demo_04_virtual_event_demo.py \
+  --config ../../configs/no_tracker_demo_config.example.json \
+  --steps 60
+\end{lstlisting}
+
+\subsubsection{飛行モード}
+
+dry-run でイベントログが確認できた後，必要に応じて飛行モードで実行する．この場合も水平移動は行わず，イベント結果を yaw pulse として反映するだけである．
+
+\begin{lstlisting}
+cd tello_no_tracker_demo_patch/python/no_tracker_demos
+python demo_04_virtual_event_demo.py \
+  --config ../../configs/no_tracker_demo_config.example.json \
+  --steps 60 \
+  --fly \
+  --yaw-norm 0.18 \
+  --yes
+\end{lstlisting}
+
+\subsubsection{成功条件}
+
+非飛行 dry-run では，各ステップの \texttt{theta}，イベント発火状況，action がログに保存されることを確認する．飛行モードでは，イベントが発火した機体だけが yaw pulse を行い，発火しない機体は hover することを確認する．
+
+\subsection{ログの確認}
+
+各デモは JSONL 形式でログを保存する．保存先は設定ファイルの \texttt{log\_dir}，または実行時の \texttt{--log-dir} で指定する．1 行が 1 イベントであり，以下のような情報が含まれる．
+
+\begin{itemize}
+  \item 壁時計時刻 \texttt{t\_wall}
+  \item イベント名 \texttt{event}
+  \item 対象 Tello 名 \texttt{drone}
+  \item 送信 action
+  \item gateway からの応答
+  \item エラー発生時の例外文字列
+  \item Demo 4 では仮想状態 \texttt{theta} とイベント発火状況
+\end{itemize}
+
+ログの例を以下に示す．
+
+\begin{lstlisting}
+{"t_wall":...,"event":"battery_all","drone":"tello-1","ok":true,"reply":{"ok":true,"resp":"87"}}
+{"t_wall":...,"event":"yaw_role_rc","step":12,"drone":"tello-2","action":[0,0,0,-0.2],"reply":{"cmd":"rc 0 0 0 -5"}}
+\end{lstlisting}
+
+
+
+\subsection{外部計測なしデモの詳細実行手順}
+\label{subsec:no_tracker_demo_detailed_steps}
+
+本節では，外部計測なしデモを実際に実行する際の具体的な順序をまとめる．ここでいう成功には二段階ある．第一段階はメイン PC から Raspberry Pi の gateway へ接続できることであり，第二段階は Raspberry Pi から対応する Tello へ SDK コマンドを送り，\texttt{ok} やバッテリ値などの応答を得られることである．Demo 1 では，この二つを分けて確認する．
+
+\subsubsection{Step 0: フォルダ構成の確認}
+
+\texttt{no\_tracker\_demo\_patch} を既存の \texttt{Tello-drone} フォルダへ組み込んだ後の想定構成は次である．
+
+\begin{lstlisting}
+Tello-drone/
+├── configs/
+│   ├── pc_real_config.local.json
+│   ├── no_tracker_demo_config.local.json
+│   └── no_tracker_demo_config.example.json
+├── python/
+│   ├── run_real_baseline.py
+│   ├── tello_rl/
+│   │   └── real/
+│   │       ├── pi_client.py
+│   │       ├── real_tracker.py
+│   │       ├── real_safety_shield.py
+│   │       └── real_tello_env.py
+│   └── no_tracker_demos/
+│       ├── no_tracker_common.py
+│       ├── demo_01_comm_check.py
+│       ├── demo_02_takeoff_hover_land.py
+│       ├── demo_03_sync_yaw_roles.py
+│       └── demo_04_virtual_event_demo.py
+├── raspberry_pi/
+│   └── tello_gateway.py
+├── docs/
+│   └── tello_no_tracker_demo_steps.tex
+└── logs/
+    └── no_tracker_demos/
+\end{lstlisting}
+
+メイン PC 側のデモスクリプトは，通常は \texttt{Tello-drone/python} から実行する．例えば Demo 1 は次のように起動する．
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+python .\no_tracker_demos\demo_01_comm_check.py ^
+  --config ..\configs\no_tracker_demo_config.local.json ^
+  --repeat 3
+\end{lstlisting}
+
+PowerShell では改行継続にバッククォート \texttt{`} を使ってもよい．1 行で実行する場合は次の形でよい．
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_01_comm_check.py --config ..\configs\no_tracker_demo_config.local.json --repeat 3
+\end{lstlisting}
+
+\subsubsection{Step 0.5: メイン PC と Raspberry Pi の Python 仮想環境を有効化する}
+
+メイン PC 側では，PowerShell で \texttt{Tello-drone/python} に移動し，仮想環境を有効化する．\texttt{Activate.ps1} が実行できない場合は，実行ポリシーを \texttt{CurrentUser} または \texttt{Process} スコープで許可してから再実行する．
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+
+各 Raspberry Pi 側では，メイン PC の PowerShell から SSH 接続し，SSH 先のシェルで仮想環境を有効化する．ユーザー名は全台で \texttt{inulab} である．
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+ssh inulab@192.168.50.102
+ssh inulab@192.168.50.103
+
+# 各 SSH 画面の中で実行
+source ~/venv/bin/activate
+\end{lstlisting}
+
+\subsubsection{Step 1: 各 Raspberry Pi で Tello Wi-Fi 接続を確認する}
+
+各 Raspberry Pi は，有線 LAN 側でメイン PC と接続しつつ，無線 LAN 側で対応する Tello の Wi-Fi に接続している必要がある．各 Raspberry Pi に SSH して，次を確認する．
+
+\begin{lstlisting}
+iwgetid
+hostname -I
+ip addr show wlan0
+ip addr show eth0
+ip route get 192.168.10.1
+\end{lstlisting}
+
+\texttt{iwgetid} で \texttt{TELLO-XXXXXX} のような SSID が表示されることを確認する．また，\texttt{hostname -I} または \texttt{ip addr show eth0} で，有線 LAN 側 IP が \texttt{no\_tracker\_demo\_config.local.json} の \texttt{host} と一致していることを確認する．
+
+必要であれば，Tello Wi-Fi へ接続し直す．
+
+\begin{lstlisting}
+nmcli dev wifi list
+sudo nmcli dev wifi connect TELLO-XXXXXX ifname wlan0
+\end{lstlisting}
+
+\subsubsection{Step 2: Raspberry Pi 単体で Tello SDK 応答を確認する}
+
+PC からのデモを実行する前に，各 Raspberry Pi から直接 Tello へ \texttt{command} と \texttt{battery?} を送って応答を確認する．この確認では，\texttt{tello\_gateway.py} が起動していると UDP ポートが競合する可能性があるため，gateway をいったん停止してから実行する．
+
+\begin{lstlisting}
+# gateway が起動している場合は Ctrl+C で停止する
+python3 - <<'PY'
+import socket, time
+
+addr = ("192.168.10.1", 8889)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("", 8889))
+sock.settimeout(5)
+
+for cmd in ["command", "battery?"]:
+    print("send:", cmd)
+    sock.sendto(cmd.encode(), addr)
+    try:
+        data, src = sock.recvfrom(1024)
+        print("reply:", data.decode(errors="replace"), "from", src)
+    except TimeoutError:
+        print("timeout: no reply")
+    time.sleep(1)
+PY
+\end{lstlisting}
+
+期待される出力は次である．
+
+\begin{lstlisting}
+send: command
+reply: ok from ('192.168.10.1', 8889)
+send: battery?
+reply: 87 from ('192.168.10.1', 8889)
+\end{lstlisting}
+
+ここで \texttt{timeout: no reply} になる場合は，PC 側プログラムではなく，Raspberry Pi--Tello 間の接続を先に修正する．典型的な原因は，Tello Wi-Fi に接続できていない，別の Tello に接続している，Tello の電源が入っていない，または \texttt{192.168.10.1} への経路が \texttt{wlan0} になっていないことである．
+
+\subsubsection{Step 3: 各 Raspberry Pi で gateway を起動したままにする}
+
+各 Raspberry Pi で \texttt{tello\_gateway.py} を起動する．このプロセスは，メイン PC からの TCP 接続を待ち受け，受け取った JSON メッセージを Tello SDK コマンドへ変換する．
+
+\begin{lstlisting}
+python3 tello_gateway.py \
+  --listen-host 0.0.0.0 \
+  --listen-port 10000 \
+  --auto-command
+\end{lstlisting}
+
+起動後，次のように表示され，シェルのプロンプトが戻ってこない状態が正常である．
+
+\begin{lstlisting}
+[gateway] sending SDK command
+ok
+[gateway] listening on 0.0.0.0:10000
+\end{lstlisting}
+
+もし \texttt{[gateway] listening ...} の後にすぐプロンプトが戻る場合，gateway は終了している．その場合，別ターミナルで \texttt{ss} を確認しても待受ポートは表示されない．gateway が正常に常駐しているかは，別の SSH ターミナルで次のように確認する．
+
+\begin{lstlisting}
+ss -ltnp | grep 10000
+ps aux | grep tello_gateway
+\end{lstlisting}
+
+期待される表示は次である．
+
+\begin{lstlisting}
+LISTEN 0 5 0.0.0.0:10000 0.0.0.0:* users:(("python3",pid=1234,fd=5))
+\end{lstlisting}
+
+\subsubsection{Step 4: メイン PC から gateway の TCP ポートを確認する}
+
+メイン PC の PowerShell から，各 Raspberry Pi の 10000 番ポートに接続できるか確認する．
+
+\begin{lstlisting}
+Test-NetConnection 192.168.50.101 -Port 10000
+Test-NetConnection 192.168.50.102 -Port 10000
+Test-NetConnection 192.168.50.103 -Port 10000
+\end{lstlisting}
+
+\texttt{TcpTestSucceeded : True} であれば，PC--Raspberry Pi 間の TCP 接続は成功している．ここまで通った状態で Demo 1 を実行する．
+
+\subsubsection{Step 5: Demo 1 を実行し，結果を二段階で解釈する}
+
+Demo 1 は，非飛行で \texttt{command}，\texttt{battery?}，\texttt{status} を送る通信確認である．
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+python .\no_tracker_demos\demo_01_comm_check.py --config ..\configs\no_tracker_demo_config.local.json --repeat 3
+\end{lstlisting}
+
+\texttt{no\_tracker\_demo\_config.local.json} の \texttt{pi\_timeout\_s} は，初期確認では短すぎない値にする．Tello からの SDK 応答が遅れることがあるため，まずは次のように 5 秒程度に設定する．
+
+\begin{lstlisting}
+"pi_timeout_s": 5.0
+\end{lstlisting}
+
+理想的な出力は，\texttt{command} に対して \texttt{ok}，\texttt{battery?} に対してバッテリ値が返る状態である．
+
+\begin{lstlisting}
+[command_all]
+  tello-1: ok elapsed=0.12s reply=ok
+  tello-2: ok elapsed=0.10s reply=ok
+  tello-3: ok elapsed=0.11s reply=ok
+
+[battery_all]
+  tello-1: ok elapsed=0.08s reply=87
+  tello-2: ok elapsed=0.09s reply=91
+  tello-3: ok elapsed=0.08s reply=84
+\end{lstlisting}
+
+一方，次のように \texttt{ok} だが \texttt{reply} が空で，\texttt{elapsed} がほぼ 2 秒になっている場合がある．
+
+\begin{lstlisting}
+[command_all]
+  tello-1: ok elapsed=2.002s reply=
+
+[battery_all]
+  tello-1: ok elapsed=2.001s reply=
+
+[status_all]
+  tello-1: ok reply={'sdk_mode': True, ..., 'last_tello_response': '', 'last_state': None}
+\end{lstlisting}
+
+この場合，PC から Raspberry Pi gateway への接続は成功しているが，Raspberry Pi から Tello への SDK 応答は確認できていない．\texttt{last\_tello\_response} が空で，\texttt{last\_state} が \texttt{None} の場合は，Step 2 の Raspberry Pi 単体テストへ戻り，Tello Wi-Fi 接続と SDK 応答を確認する．
+
+したがって，Demo 1 の判定は次のように分ける．
+
+\begin{itemize}
+  \item \texttt{status} が即座に返る：PC--Raspberry Pi 間の TCP 通信は成立している．
+  \item \texttt{command} の \texttt{reply=ok} が返る：Raspberry Pi--Tello 間の SDK command 通信も成立している．
+  \item \texttt{battery?} の \texttt{reply} に数値が返る：Tello からの query 応答も取得できている．
+  \item \texttt{reply} が空で 2 秒程度かかる：gateway は動いているが，Tello からの応答が返っていない可能性が高い．
+\end{itemize}
+
+\subsubsection{Step 6: Demo 2 以降に進む条件}
+
+Demo 2 以降は飛行を伴うため，最低限，次の条件を満たしてから進む．
+
+\begin{itemize}
+  \item 3 台すべてについて，PC から gateway の \texttt{status} が返る．
+  \item 3 台すべてについて，Raspberry Pi 単体テストで \texttt{command} に \texttt{ok} が返る．
+  \item 3 台すべてについて，\texttt{battery?} に数値が返り，バッテリ残量が十分である．
+  \item 各 gateway が \texttt{0.0.0.0:10000} で待ち受けており，プロンプトが戻らず常駐している．
+  \item 飛行領域が十分広く，3 台の Tello が互いに十分離れている．
+\end{itemize}
+
+条件を満たしたら，まず短時間の hover デモだけを実行する．
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_02_takeoff_hover_land.py --config ..\configs\no_tracker_demo_config.local.json --hover-seconds 10
+\end{lstlisting}
+
+その後，必要に応じて yaw のみを使う役割付きデモへ進む．
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_03_sync_yaw_roles.py --config ..\configs\no_tracker_demo_config.local.json --duration 15 --yaw-norm 0.15
+\end{lstlisting}
+
+最後に，仮想イベントトリガ協調デモは，まず dry-run で実行する．
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_04_virtual_event_demo.py --config ..\configs\no_tracker_demo_config.local.json --steps 60
+\end{lstlisting}
+
+飛行モードで実行する場合でも，水平移動は指令せず，イベント発火を低速 yaw pulse として反映するだけにする．
+
+\subsection{推奨実行順序}
+
+外部計測なしの段階では，以下の順序で確認する．
+
+\begin{enumerate}
+  \item Demo 1 を実行し，非飛行で 3 台分の通信が正常であることを確認する．
+  \item Demo 2 を短時間で実行し，3 台同時の離陸・hover・着陸を確認する．
+  \item Demo 3 を短時間で実行し，役割別 yaw action の配信を確認する．
+  \item Demo 4 を dry-run で実行し，仮想合意・イベントトリガのログを確認する．
+  \item 必要に応じて Demo 4 を飛行モードで実行し，イベント発火を yaw pulse として反映する．
+  \item 外部計測系を導入した後，位置フィードバック制御，複数機距離維持，対象物取り囲みへ進む．
+\end{enumerate}
+
+\subsection{本デモの限界}
+
+本デモで確認できるのは，通信・同期・役割別指令・watchdog・ログ保存までである．以下は確認できない．
+
+\begin{itemize}
+  \item 対象物を中心とする取り囲み誤差．
+  \item 機体間距離制約の実時間監視．
+  \item 壁距離制約の実時間監視．
+  \item 外部計測に基づく安全シールド．
+  \item 学習済み方策の位置フィードバック性能．
+\end{itemize}
+
+したがって，論文や発表では，本デモを「外部計測導入前の通信・制御基盤確認デモ」と位置づけるのが適切である．協調取り囲み制御の実証は，外部計測系を導入して各 Tello と対象物の位置を取得できるようになってから行う．
+
+\subsection{トラブルシューティング}
+
+\subsubsection{Demo 1 で \texttt{connection refused} になる}
+
+Raspberry Pi 側で \texttt{tello\_gateway.py} が起動していない，または IP アドレス・ポートが設定ファイルと一致していない可能性がある．各 Raspberry Pi 上で gateway の起動ログを確認する．
+
+\subsubsection{\texttt{battery?} が空文字になる}
+
+Raspberry Pi は Tello Wi-Fi に接続できているが，Tello が SDK mode に入っていない可能性がある．\texttt{--auto-command} を付けて gateway を起動するか，Demo 1 で \texttt{--skip-command} を付けずに実行する．
+
+\subsubsection{takeoff 後にすぐ land する}
+
+Raspberry Pi 側 watchdog が，PC からの \texttt{rc} 指令欠落を検出している可能性がある．Demo 2 では \texttt{rate\_hz} を 10 Hz 程度にし，PC と Raspberry Pi 間の有線 LAN 接続が安定しているか確認する．
+
+\subsubsection{yaw が速すぎる}
+
+\texttt{--yaw-norm} または \texttt{--rc-limit} を下げる．初期値としては，\texttt{rc\_limit=25}，\texttt{yaw\_norm=0.15} から始めるとよい．
+
+\subsubsection{機体が水平に流れる}
+
+外部計測なしではドリフトを補正できない．即座に \texttt{land} し，飛行領域，床面，照明，Tello の状態，バッテリ残量を確認する．本デモでは水平移動を指令していないため，流れが大きい場合は飛行デモを中止する．
+
+\section{まとめ}
+\label{sec:summary}
+
+本追加実装では，通常 Tello の Wi-Fi 制約を回避するために，Tello 1 台につき Raspberry Pi 1 台を割り当てるゲートウェイ構成を採用する．PC は全体の状態推定，安全評価，制御計算を担当し，Raspberry Pi は対応する Tello への SDK コマンド送信を担当する．この分担により，既存の command-level action 表現を保ったまま，通常 Tello 複数台の実機実験へ移行できる．
+
+実機投入は，必ず単機通信確認，外部計測確認，単機位置制御，複数機固定位置制御，静止対象物取り囲み，移動対象物追従，学習済み方策評価の順に進める．特に，外部計測と安全シールドが安定するまでは，RL 方策を直接実機へ接続しない．
+
+\end{document}

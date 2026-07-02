@@ -1,0 +1,48 @@
+# Raspberry Pi Tello gateway — operation notes
+# Each Pi connects wlan0 to its own Tello (every Pi sees its Tello as 192.168.10.1).
+
+# --- One-time setup: install the gateway as an auto-starting service ---------
+# Run once on each Pi (and again after pulling new code). Starts on boot,
+# restarts on failure, disables wlan0 power save, and keeps the Tello awake
+# with an idle keepalive so it does not auto power off.
+#
+#   sudo bash raspberry_pi/install.sh
+#
+# Check that it is running / see the startup banner and link events:
+#   systemctl status tello-gateway
+#   journalctl -u tello-gateway -f
+#     -> "[hh:mm:ss] [gateway] listening on 0.0.0.0:10000"   (started)
+#     -> "[hh:mm:ss] [gateway] TELLO LINK UP"                 (drone connected)
+#     -> "[hh:mm:ss] [gateway] TELLO LINK LOST"               (drone connection dropped)
+#     -> "[hh:mm:ss] [gateway] TELLO LINK RESTORED"           (reconnected)
+
+# --- Fleet-wide view from the desktop PC -------------------------------------
+# Live monitor: shows UP / DOWN / UNREACHABLE + battery for every gateway,
+# and prints an ALERT line whenever a drone link is lost or restored.
+#
+#   python python/pi_monitor.py --config configs/pc_real_config.example.json
+#
+# One-shot fleet CLI (run from the python/ directory):
+#   python -m tello_fleet status --config ../configs/pc_real_config.example.json
+#   python -m tello_fleet doctor --config ../configs/pc_real_config.example.json
+#     -> pre-flight PASS/FAIL per drone (reachable, SDK mode, link up, battery);
+#        exits non-zero if any drone is not ready.
+
+# --- Manual run (debug only; normally systemd does this) ---------------------
+#   python3 raspberry_pi/tello_gateway.py --listen-host 0.0.0.0 --listen-port 10000 \
+#       --auto-command --rc-default-limit 30 --keepalive 10 --link-timeout 4
+
+# --- Manual protocol test from the desktop PC --------------------------------
+#   nc 192.168.50.101 10000
+# Then send one JSON line at a time:
+#   {"type":"command"}
+#   {"type":"query","cmd":"battery?"}
+#   {"type":"status"}
+#   {"type":"takeoff"}
+#   {"type":"rc","a":[0,0,0,0],"rc_limit":20}
+#   {"type":"land"}
+
+# --- Service management -------------------------------------------------------
+#   sudo systemctl restart tello-gateway    # after config/code change
+#   sudo systemctl stop tello-gateway       # take manual control
+#   sudo systemctl disable tello-gateway    # stop auto-start on boot

@@ -1,0 +1,34 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "calibration": "configs/camera_calib.npz"
+  },
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "marker_length_m": 0.10,
+    "world_marker_id": 10,
+    "world_marker_length_m": 0.75
+  },
+  "ids": {
+    "drones": [1, 2, 3],
+    "target": 10
+  },
+  "extrinsics": {
+    "R_wc": null,
+    "t_wc": null
+  },
+  "smoothing": {
+    "pos_ema": 0.5,
+    "vel_ema": 0.4,
+    "hold_timeout_s": 0.5
+  },
+  "output": {
+    "host": "127.0.0.1",
+    "port": 15000,
+    "rate_hz": 30.0
+  },
+  "viz": true
+}

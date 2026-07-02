@@ -1,0 +1,23 @@
+[Unit]
+Description=Tello Pi gateway (session owner: keepalive + link health)
+# wlan0 autoconnect to the Tello SSID is handled by NetworkManager.
+# The gateway tolerates the Tello not being reachable yet (keepalive + command retry),
+# so we only wait for the network stack to be up, not for a specific association.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root: the code path is fixed at /opt/tello-gateway (see install.sh) and
+# running as root lets ExecStartPre disable Wi-Fi power save without extra caps.
+# '-' tolerates failure if wlan0 is momentarily unavailable at boot.
+ExecStartPre=-/usr/sbin/iw dev wlan0 set power_save off
+ExecStart=/usr/bin/python3 /opt/tello-gateway/tello_gateway.py \
+    --listen-host 0.0.0.0 --listen-port 10000 \
+    --auto-command --rc-default-limit 30 \
+    --keepalive 10 --link-timeout 4
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
