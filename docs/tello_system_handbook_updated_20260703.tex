@@ -1,0 +1,1274 @@
+% =====================================================================
+%  Tello × Raspberry Pi 群制御システム 総合手順書
+%  Compile:  lualatex tello_system_handbook_updated_20260703.tex   (LuaLaTeX + LuaTeX-ja)
+%            2回実行すると目次・参照が確定します。
+% =====================================================================
+\documentclass[11pt,a4paper]{ltjsarticle}
+
+\usepackage{luatexja-fontspec}
+\usepackage[margin=22mm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{amssymb}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\definecolor{codeframe}{gray}{0.75}
+\definecolor{accent}{RGB}{0,90,160}
+
+\hypersetup{colorlinks=true, linkcolor=accent, urlcolor=accent}
+
+% ---- inline code / listing style ------------------------------------
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  rulecolor=\color{codeframe},
+  backgroundcolor=\color{codebg},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2,
+  xleftmargin=6pt,
+  framexleftmargin=6pt,
+  postbreak=\mbox{\textcolor{gray}{$\hookrightarrow$}\space},
+}
+
+\newcommand{\note}[1]{\par\smallskip\noindent\textbf{メモ:}~#1\par\smallskip}
+\newcommand{\warning}[1]{\par\smallskip\noindent\textbf{注意:}~#1\par\smallskip}
+
+\title{\textbf{Tello × Raspberry Pi 群制御システム\\ 総合手順書}}
+\author{構成・自動起動・keepalive・外部計測(ArUco)・群制御・運用}
+\date{2026-07-03 版}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{はじめに}
+本書は、PC(母艦) と複数のラズパイ、複数の DJI Tello から成る屋内群制御システムの
+構成・仕組み・導入手順・運用・トラブル対応を一冊にまとめたものである。対象範囲は次の
+通り。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item ネットワーク設計(二重ネットワーク・固定IP)と SSH/SCP による遠隔操作・ファイル転送
+  \item ラズパイゲートウェイ(常駐サービス)の仕組みと自動起動 (systemd)
+  \item Tello を維持する keepalive とリンク死活監視
+  \item PC 側ライブラリ \code{tello\_fleet}(DroneClient / Fleet)と CLI・監視ツール
+  \item ArUco 外部計測(天井カメラ)とカメラキャリブレーション
+  \item 群制御デモ(取り囲み)の実行と安全シールド
+  \item 実際に遭遇した不具合と対処(トラブルシューティング集)
+\end{itemize}
+
+% =====================================================================
+\section{システム全体構成}
+
+\subsection{トポロジー}
+\begin{lstlisting}
+        (有線 LAN / スイッチングハブ)              (各Pi固有のWi-Fi)
+ [ 母艦PC ] ====== eth ====== [ ラズパイ x N ] ---- wlan ---- [ Tello x N ]
+     |                              |                              |
+     | TCP :10000 (JSON-lines)      | UDP 8889 : SDKコマンド/応答   | 各Piは自分の
+     |  制御・監視                   | UDP 8890 : Tello state stream |  Telloを
+     |                              |                              | 192.168.10.1
+ [ 天井カメラ ] --USB--> run_aruco_tracker.py --UDP :15000--> 制御プログラム
+                         (ArUco外部計測: 位置・速度・yaw を世界座標で送信)
+\end{lstlisting}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item トポロジーは「PC ---有線--- Pi$\times$N ---Wi-Fi--- Tello$\times$N」。各 Pi は自分の
+        Tello の AP に接続し、Tello を \code{192.168.10.1} として見る。
+  \item PC $\leftrightarrow$ Pi は TCP(改行区切り JSON)。Pi $\leftrightarrow$ Tello は Tello SDK の UDP。
+  \item 位置計測は外部の天井カメラ + ArUco。計測結果は UDP JSON で制御プログラムへ。
+  \item Tello は通常版(非EDU)のため、Pi ごとに個別 Wi-Fi 接続が必須。
+\end{itemize}
+
+\subsection{コンポーネント一覧}
+\begin{longtable}{@{}p{4.6cm}p{2.4cm}p{8.2cm}@{}}
+\toprule
+\textbf{ファイル/要素} & \textbf{実行場所} & \textbf{役割} \\
+\midrule
+\endhead
+\code{raspberry\_pi/tello\_gateway.py} & 各ラズパイ & ゲートウェイ本体(常駐)。TCP受け $\to$ Tello UDP 中継、keepalive、リンク死活。\\
+\code{raspberry\_pi/tello-gateway.service} & 各ラズパイ & systemd ユニット(自動起動)。\\
+\code{raspberry\_pi/install.sh} & 各ラズパイ & \code{/opt/tello-gateway} へ設置・enable・起動。\\
+\code{python/tello\_fleet/} & 母艦PC & 制御ライブラリ(DroneClient / Fleet)+ \code{fleet} CLI。\\
+\code{python/pi\_monitor.py} & 母艦PC & 全機ライブ監視(UP/DOWN/UNREACHABLE)。\\
+\code{python/run\_aruco\_tracker.py} & 母艦PC & ArUco 外部計測。位置を UDP 送信。\\
+\code{python/calibrate\_camera.py} & 母艦PC & カメラ校正 + マーカ/ボード生成。\\
+\code{python/run\_enclosing\_demo.py} & 母艦PC & 3機の取り囲み群制御デモ。\\
+\code{python/tello\_rl/real/} & 母艦PC & 実機環境(RealTelloEnv)・トラッカ受信・安全シールド。\\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{動作環境}
+\begin{longtable}{@{}p{4.2cm}p{11cm}@{}}
+\toprule
+\textbf{項目} & \textbf{内容} \\
+\midrule
+\endhead
+母艦PC & Windows 11。作業ディレクトリ \code{C:\textbackslash Users\textbackslash inulab\textbackslash Work\textbackslash Tello-drone}。\\
+Python(PC) & 仮想環境 \code{python/venv}。numpy, opencv-contrib-python(cv2.aruco) 等。\\
+ラズパイ & 例: \code{inulab@inulab-rpi-01}(有線 LAN。IP は \code{192.168.50.101\textrm{--}103} 等)。\\
+Python(Pi) & システムの \code{/usr/bin/python3}(標準ライブラリのみでゲートウェイ動作)。\\
+Tello & 通常版(非EDU)。SDK モードで UDP 制御。\\
+カメラ & 天井設置(USB)。運用解像度は校正解像度と一致させること(後述)。\\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{ネットワーク構成と IP 設計}
+
+\subsection{二重ネットワークの考え方}
+各ラズパイは同時に 2 つのネットワークに参加する。
+
+\begin{longtable}{@{}p{3.4cm}p{11.6cm}@{}}
+\toprule
+\textbf{インターフェース} & \textbf{用途} \\
+\midrule
+\endhead
+\code{eth0} / \code{end0} & 有線 LAN 側。PC との制御・SSH・SCP 用。\\
+\code{wlan0} & 無線側。対応する Tello の SDK 通信用(Tello は \code{192.168.10.1})。\\
+\bottomrule
+\end{longtable}
+
+Tello は全機が同じ \code{192.168.10.1} を使うため、有線 LAN 側は必ず別サブネット
+(例 \code{192.168.50.0/24})に分ける。\textbf{有線側と Tello 側を同じ
+\code{192.168.10.0/24} にしてはいけない}。ラズパイはルータにはしない
+(IP forwarding / bridge は不要)。アプリケーション層でのみ中継する。
+
+\subsection{IP アドレス設計例}
+\begin{longtable}{@{}p{4.4cm}p{3.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{機器} & \textbf{インターフェース} & \textbf{IP アドレス} \\
+\midrule
+\endhead
+デスクトップ PC & Ethernet & \code{192.168.50.10/24} \\
+Raspberry Pi 1 & eth0/end0 & \code{192.168.50.101/24} \\
+Raspberry Pi 2 & eth0/end0 & \code{192.168.50.102/24} \\
+Raspberry Pi 3 & eth0/end0 & \code{192.168.50.103/24} \\
+各 Tello & (Pi の wlan0 先) & \code{192.168.10.1}(全機共通) \\
+\bottomrule
+\end{longtable}
+スイッチングハブだけでは DHCP されないため、PC と各 Pi の両方に固定 IP を設定する。
+本書ではユーザー名を全台 \code{inulab} に統一している。
+
+% =====================================================================
+\section{ラズパイ初期セットアップ}
+
+\subsection{前提条件}
+\begin{enumerate}[leftmargin=1.6em]
+  \item PC と全ラズパイは同じ有線 LAN(スイッチングハブ)に接続。
+  \item 各ラズパイの \code{wlan0} は対応する 1 台の Tello Wi-Fi に接続。
+  \item PC は Tello の \code{192.168.10.1} へ直接アクセスせず、各 Pi の有線 LAN 側 IP のみ扱う。
+  \item 実機飛行時は安全ネット・十分な飛行領域・緊急停止手段・予備バッテリを用意。
+\end{enumerate}
+
+\subsection{有線 LAN 側 IP の固定(NetworkManager)}
+接続名とインターフェース名を確認する(機種により \code{eth0} でなく \code{end0} のことがある)。
+\begin{lstlisting}
+nmcli con show
+ip -br addr
+\end{lstlisting}
+Pi-1 の例(接続名 "Wired connection 1"):
+\begin{lstlisting}
+sudo nmcli con mod "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.50.101/24 \
+  ipv4.gateway "" ipv4.dns "" \
+  ipv6.method disabled
+sudo nmcli con up "Wired connection 1"
+\end{lstlisting}
+Pi-2 は \code{192.168.50.102/24}、Pi-3 は \code{192.168.50.103/24} を割り当てる。
+
+\subsection{Tello Wi-Fi への接続}
+Tello Wi-Fi をデフォルト経路にしないため \code{ipv4.never-default yes} を付ける。
+\begin{lstlisting}
+sudo nmcli dev wifi rescan
+nmcli dev wifi list
+sudo nmcli con add type wifi ifname wlan0 con-name tello1 ssid TELLO-XXXXXX
+sudo nmcli con mod tello1 ipv4.method auto ipv4.never-default yes ipv6.method disabled
+sudo nmcli con up tello1
+\end{lstlisting}
+接続確認:
+\begin{lstlisting}
+iwgetid                      # 接続中の SSID
+ip -br addr                  # eth0=192.168.50.10x, wlan0=192.168.10.x
+ip route get 192.168.10.1
+ping -c 3 192.168.10.1
+\end{lstlisting}
+
+\subsection{SSH サーバの有効化}
+\begin{lstlisting}
+sudo systemctl enable --now ssh
+sudo systemctl status ssh
+# 入っていなければ:
+sudo apt update && sudo apt install -y openssh-server
+sudo ss -tlnp | grep :22     # 22番ポート待受を確認
+\end{lstlisting}
+
+\subsection{自ホスト名の解決(sudo 遅延対策)}
+\code{/etc/hosts} に自ホスト名が無いと \code{sudo} が毎回名前解決に失敗して遅くなる。
+\begin{lstlisting}
+grep -q inulab-rpi-01 /etc/hosts || echo "127.0.1.1 inulab-rpi-01" | sudo tee -a /etc/hosts
+\end{lstlisting}
+
+% =====================================================================
+\section{PC から Pi への SSH / SCP}
+
+\subsection{PC 側 Ethernet の固定 IP}
+ハブに接続した Ethernet アダプタに固定 IP を設定する(IP \code{192.168.50.10}、
+サブネットマスク \code{255.255.255.0}、デフォルトゲートウェイ・DNS は空欄)。
+PowerShell で \code{ipconfig} により確認する。
+
+\subsection{SSH 接続}
+PC の PowerShell から有線 LAN 側 IP を指定して接続する。ユーザー名は全台 \code{inulab}。
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+ssh inulab@192.168.50.102
+ssh inulab@192.168.50.103
+\end{lstlisting}
+プロンプト \code{inulab@inulab-rpi-01:\textasciitilde{} \$} は「\code{@} の前=ユーザー名、\code{@} の後=ホスト名」。
+ホスト名(\code{inulab-rpi-01})をユーザー名として指定しないこと。ログイン中の端末では
+\code{whoami} でユーザー名(\code{inulab})を確認できる。
+
+\subsection{SCP によるファイル転送}
+\code{scp} は \emph{PC 側の PowerShell} で実行する(Pi にログインした状態で Windows の
+\code{C:} を指定しても Pi からは見えない)。
+\begin{lstlisting}
+# PC -> Pi (送信)
+scp .\raspberry_pi\tello_gateway.py inulab@192.168.50.101:~/tello_gateway.py
+# Pi -> PC (ログ回収)
+scp inulab@192.168.50.101:/home/inulab/log.csv .\
+# 転送確認
+ssh inulab@192.168.50.101 "ls -l ~/tello_gateway.py"
+\end{lstlisting}
+
+\subsection{典型的なエラーと対処}
+\begin{longtable}{@{}p{5.2cm}p{9.4cm}@{}}
+\toprule
+\textbf{症状} & \textbf{対処} \\
+\midrule
+\endhead
+\code{ping 192.168.50.101} がタイムアウト & 有線が未成立。PC/Pi の IP、同一ハブ接続、ケーブル/リンクランプ、Pi の \code{ip link} が \code{NO-CARRIER} でないかを確認。\\
+\code{Connection refused (port 22)} & IP には到達。Pi の SSH が未起動。\code{sudo systemctl enable -{}-now ssh}。\\
+\code{Could not resolve hostname c} & \code{C:/...} の \code{C:} がホスト指定と誤解された。scp は Pi 上でなく \emph{PC の PowerShell} で実行する。\\
+\code{Permission denied} & ユーザー名/パスワード誤り。\code{inulab@<IP>} 形式で接続(ホスト名をユーザー名にしない)。\\
+\code{sudo: 名前解決できません} & \code{/etc/hosts} に自ホスト名を追加(前節)。\\
+\bottomrule
+\end{longtable}
+
+\subsection{推奨する確認順序}
+\begin{enumerate}[leftmargin=1.6em]
+  \item PC の Ethernet IP が \code{192.168.50.10/24}。
+  \item Pi の有線 IP が \code{192.168.50.10x/24}。
+  \item Pi の \code{wlan0} が Tello に接続し \code{192.168.10.x} が付与されている。
+  \item PC から \code{ping 192.168.50.101} が通る。
+  \item Pi で SSH サーバが起動している。
+  \item PC から \code{ssh inulab@192.168.50.101} でログインできる。
+  \item PC の PowerShell から \code{scp} で転送し、Pi 上で \code{ls -l} により確認。
+\end{enumerate}
+
+% =====================================================================
+\section{PC 側 Python 環境(venv・実行ポリシー)}
+既存プロジェクトの \code{python/} で仮想環境を作成・有効化してからスクリプトを実行する。
+PowerShell で \code{Activate.ps1} が拒否される場合は、ユーザー単位で \code{RemoteSigned} を許可する。
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+python -m venv venv
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+\end{lstlisting}
+恒久的な変更を避けたい場合は、現在の PowerShell セッションだけ一時許可する。
+\begin{lstlisting}
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+プロンプト先頭に \code{(venv)} が付けば有効化できている。
+
+\note{本番のゲートウェイは systemd(root・システムの \code{python3}・標準ライブラリのみ)で
+動くため、\emph{ラズパイ側に venv は不要}。Pi 側 venv は手動デバッグ時のみ任意。}
+
+% =====================================================================
+\section{通信プロトコル (PC $\leftrightarrow$ Pi)}
+改行区切り JSON を TCP で送受信し、1 リクエストにつき 1 行の JSON が返る。
+
+\subsection{PC $\to$ Pi メッセージ}
+\begin{longtable}{@{}p{3.4cm}p{11.6cm}@{}}
+\toprule
+\textbf{type} & \textbf{意味 / 例} \\
+\midrule
+\endhead
+\code{command} & SDK モードに入る。\code{\{"type":"command"\}} \\
+\code{takeoff} & 離陸。応答完了まで待つ(最大 8s)。\\
+\code{land} & 着陸。\\
+\code{emergency} & 即時停止(応答待ちなし)。\\
+\code{stop} & その場停止。\\
+\code{query} & SDK クエリ。\code{\{"type":"query","cmd":"battery?"\}}(末尾 \code{?} 必須)\\
+\code{rc} & 速度指令。\code{\{"type":"rc","a":[lr,fb,ud,yaw],"rc\_limit":30\}}(各 $-1..1$)\\
+\code{status} & ゲートウェイ状態を返す(Tello へは送らない)。\\
+\bottomrule
+\end{longtable}
+
+\subsection{Pi $\to$ PC 応答}
+\code{\{"ok":true/false, "t":<epoch>, ...\}}。\code{rc} は \code{cmd},\code{rc}、\code{query} は
+\code{cmd},\code{resp}、\code{status} は下記 \code{status} オブジェクトを含む。
+
+% =====================================================================
+\section{ラズパイゲートウェイの仕組み}
+
+\subsection{役割とスレッド構成}
+\code{tello\_gateway.py} は「セッション所有者」として常駐し、電源 ON 直後から Tello を
+SDK モードに保つ。起動時に \code{command} を送り、以下 4 スレッドを走らせる。
+
+\begin{longtable}{@{}p{3.6cm}p{11.4cm}@{}}
+\toprule
+\textbf{スレッド} & \textbf{役割} \\
+\midrule
+\endhead
+tello-response & Tello の UDP コマンド応答を受信(\code{last\_tello\_response\_time} 更新)。\\
+tello-state & Tello の state stream(port 8890)を受信(\code{last\_state\_time} 更新=生存信号)。\\
+watchdog & 飛行中に rc が \code{hover-timeout} 途絶で hover、\code{land-timeout} で land(安全弁)。\\
+keepalive & アイドル時の電源オフ対策 + リンク死活判定(下記)。\\
+\bottomrule
+\end{longtable}
+
+\subsection{keepalive とリンク死活}
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{電源オフ対策}: アイドル時(非 armed かつ「最後に \emph{Tello へ} 送信してから
+        \code{keepalive} 秒以上」)に限り、\code{keepalive} 秒周期で \code{battery?} を送る。
+        飛行中は rc ストリームが keepalive を兼ねるため送らない(制御ループに割り込まない)。
+  \item \textbf{重要な設計}: アイドル判定は「PC からの通信」ではなく「\emph{Tello} への最終送信
+        時刻(\code{\_last\_send\_time})」で行う。これにより PC 側の \code{status} ポーリング
+        (Tello へは届かない)が keepalive を抑制しない。
+  \item \textbf{死活判定}: 「state stream か応答の最終受信」から \code{link-timeout} 秒
+        (既定 4s)超過で \code{down}、回復で \code{up}。遷移を journald に \code{TELLO LINK LOST}
+        / \code{RESTORED} として記録。down の間は \code{command} を再送して自動復帰を試みる。
+  \item \textbf{ハートビート}: 60 秒ごとに \code{alive: link=up battery=.. last\_seen=0.Xs} を
+        出力(keepalive が生きている確認用)。
+\end{itemize}
+
+\subsection{\code{status} が返すフィールド}
+\begin{longtable}{@{}p{4.6cm}p{10.4cm}@{}}
+\toprule
+\textbf{フィールド} & \textbf{意味} \\
+\midrule
+\endhead
+\code{tello\_link} & \code{init}/\code{up}/\code{down}。Tello との無線の死活。\\
+\code{sdk\_mode} & SDK モードに入っているか。\\
+\code{armed} & 離陸済み(飛行中とみなす)か。takeoff で true、land/emergency で false。\\
+\code{battery} & 直近の \code{battery?} 応答値[\%]。\\
+\code{uptime\_s} & ゲートウェイ(サービス)の稼働秒。\emph{ドローンの接続継続時間ではない}。\\
+\code{last\_seen\_age\_s} & Tello から最後に生存信号を受けてからの秒。小さいほど新鮮。\\
+\bottomrule
+\end{longtable}
+
+\subsection{起動引数}
+\begin{longtable}{@{}p{4.0cm}p{2.2cm}p{8.8cm}@{}}
+\toprule
+\textbf{引数} & \textbf{既定} & \textbf{意味} \\
+\midrule
+\endhead
+\code{-{}-listen-host} & \code{0.0.0.0} & TCP 待受アドレス \\
+\code{-{}-listen-port} & \code{10000} & TCP 待受ポート \\
+\code{-{}-tello-ip} & \code{192.168.10.1} & Tello の IP \\
+\code{-{}-local-cmd-port} & \code{8889} & コマンド送信/応答 UDP \\
+\code{-{}-state-port} & \code{8890} & state 受信 UDP \\
+\code{-{}-rc-default-limit} & \code{30} & rc 絶対値上限の既定 \\
+\code{-{}-hover-timeout} & \code{0.35} & 飛行中この秒 rc 途絶で hover \\
+\code{-{}-land-timeout} & \code{1.50} & 飛行中この秒 rc 途絶で land \\
+\code{-{}-keepalive} & \code{10} & アイドル keepalive 周期[s](0 で無効) \\
+\code{-{}-link-timeout} & \code{4} & 生存信号なしで link down とする秒 \\
+\code{-{}-auto-command} & --- & 起動時に \code{command} を1回送る \\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{自動起動 (systemd)}
+
+\subsection{固定配置(自動検出しない)}
+ユーザー名やリポジトリ構造に依存しないよう、\code{install.sh} がソースを次の固定パスへ
+コピーして登録する。
+
+\begin{longtable}{@{}p{4.6cm}p{10.4cm}@{}}
+\toprule
+\textbf{実体} & \textbf{Pi 上の固定パス} \\
+\midrule
+\endhead
+ゲートウェイ本体 & \code{/opt/tello-gateway/tello\_gateway.py} \\
+systemd ユニット & \code{/etc/systemd/system/tello-gateway.service} \\
+実行ユーザー & \textbf{root}(\code{iw power\_save off} を追加権限なしで実行するため) \\
+\bottomrule
+\end{longtable}
+
+\subsection{ユニットファイル}
+\begin{lstlisting}
+[Unit]
+Description=Tello Pi gateway (session owner: keepalive + link health)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/sbin/iw dev wlan0 set power_save off
+ExecStart=/usr/bin/python3 /opt/tello-gateway/tello_gateway.py \
+    --listen-host 0.0.0.0 --listen-port 10000 \
+    --auto-command --rc-default-limit 30 \
+    --keepalive 10 --link-timeout 4
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+\end{lstlisting}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{Restart=always} で落ちても復帰。\code{After/Wants=network-online.target} で
+        ネットワーク起動後に開始。Tello 未接続でも待てる設計(§\ref{sec:trouble})。
+  \item \code{iw wlan0 set power\_save off} は Wi-Fi 省電力によるリンク断防止。
+\end{itemize}
+
+\subsection{デプロイ手順}
+\textbf{(1) 母艦PC(PowerShell)から Pi へソースを送る}(3ファイルを1フォルダにまとめて任意の場所へ):
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\raspberry_pi
+scp install.sh tello_gateway.py tello-gateway.service inulab@192.168.50.101:/home/inulab/
+\end{lstlisting}
+
+\textbf{(2) Pi 上で設置}:
+\begin{lstlisting}
+sudo bash ~/install.sh
+# 実行時に設置先が表示される:
+#   gateway -> /opt/tello-gateway/tello_gateway.py
+#   unit    -> /etc/systemd/system/tello-gateway.service
+\end{lstlisting}
+コード更新時も同じ 2 手順(scp $\to$ install.sh)を再実行するだけ(冪等)。
+
+\subsection{動作確認}
+\begin{lstlisting}
+systemctl status tello-gateway        # Active: active (running) を確認
+systemctl is-enabled tello-gateway    # enabled = 再起動時も自動起動
+journalctl -u tello-gateway -f        # 起動バナー / LINK UP/LOST / alive を確認
+\end{lstlisting}
+
+% =====================================================================
+\section{PC 側ソフトウェア: \code{tello\_fleet}}
+
+\subsection{構成}
+PC 側クライアントは \code{tello\_fleet} に一本化されている。
+
+\begin{longtable}{@{}p{3.8cm}p{11.2cm}@{}}
+\toprule
+\textbf{要素} & \textbf{役割} \\
+\midrule
+\endhead
+\code{DroneClient} & 1 ゲートウェイの TCP クライアント。\code{GatewaySpec} でも host 文字列でも構築可。\\
+\code{Fleet} & N 機の一括操作。\code{from\_config/from\_hosts}、\code{status\_all}、\code{doctor}、\code{land\_all\_safe}。\\
+\code{GatewayReply} & 応答(\code{ok},\code{raw},\code{elapsed\_s},\code{error},\code{resp})。\\
+CLI & \code{python -m tello\_fleet status|doctor -{}-config ...}\\
+\bottomrule
+\end{longtable}
+
+\note{旧 \code{pi\_client.PiTelloClient/PiTelloGroup} と \code{no\_tracker\_common.PiGatewayClient}
+は \code{tello\_fleet} への薄い別名(shim)になっており、既存のデモ・実験コードは無改修で動く。}
+
+\subsection{fleet CLI}
+\begin{lstlisting}
+cd python
+python -m tello_fleet status --config ../configs/pc_real_config.local.json
+python -m tello_fleet doctor --config ../configs/pc_real_config.local.json
+\end{lstlisting}
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{status}: 各機を UP/DOWN/UNREACHABLE + 電池 + age + SDK + uptime で1行表示。
+  \item \code{doctor}: 離陸前チェック(到達可能・SDK・link up・電池)。未 ready なら終了コード非0。
+  \item \code{UP/DOWN} は Tello との無線、\code{UNREACHABLE} は Pi/サービス自体に届かない、の区別。
+\end{itemize}
+
+\subsection{ライブ監視 pi\_monitor}
+\begin{lstlisting}
+python python/pi_monitor.py --config configs/pc_real_config.local.json
+\end{lstlisting}
+各機を周期表示し、リンク切断/復帰で \code{*** ALERT ***} 行を出す。
+
+\subsection{障害時ポリシー(全機 land)}
+飛行実験中に外部計測(テレメトリ)が途絶した場合、\code{RealTelloEnv} は Fleet 経由で
+\textbf{全機着陸}(\code{land\_all\_safe})を行う。1 機でも“目隠し”状態で編隊を続けるより、
+安全とデータ整合性を優先する方針。Pi 側 watchdog は最後の安全弁として残す。
+
+% =====================================================================
+\section{外部計測: ArUco トラッカ}
+
+\subsection{座標系}
+世界座標は ENU 型。水平 $r=[x,y]$[m]、高度 $h=z$[m]、yaw $=\psi$[rad]。世界原点は床に
+置いた基準マーカ(\code{world\_marker\_id})の座標系で定義する。天井カメラは床より上に
+あるという拘束から、高度 $h$ が常に正になるよう自動で $z$ 上向きを強制する。
+
+\subsection{トラッカ設定(\code{aruco\_tracker\_config.local.json})}
+\begin{lstlisting}
+{
+  "camera":  { "index":0, "width":1920, "height":1080, "fps":30,
+               "calibration":"configs/camera_calib.npz" },
+  "aruco":   { "dictionary":"DICT_4X4_50",
+               "marker_length_m":0.04,       // ドローン/対象物マーカの実測一辺[m]
+               "world_marker_id":10,         // 視野内に実在する固定の原点マーカID
+               "world_marker_length_m":0.075 // 原点マーカの実測一辺[m]
+             },
+  "ids":     { "drones":[1,2,3], "target":null },
+  "extrinsics": { "R_wc":null, "t_wc":null },
+  "smoothing":  { "pos_ema":0.5, "vel_ema":0.4, "hold_timeout_s":0.5 },
+  "output":  { "host":"127.0.0.1", "port":15000, "rate_hz":30.0 },
+  "viz": true
+}
+\end{lstlisting}
+
+\subsection{重要な注意(実測で嵌りやすい点)}
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{マーカ実寸を必ず反映}: \code{marker\_length\_m} と \code{world\_marker\_length\_m} は
+        印刷物を定規で測った実寸。ここがずれると位置・高度が比例してずれる
+        (例: 原点マーカを 0.75 と誤設定 $\to$ 高度が十数 m に膨張)。
+  \item \textbf{原点マーカ ID は実在・固定・ユニーク}: \code{world\_marker\_id} は「視野内に
+        実際に映っている固定マーカの ID」。存在しない ID を指定すると世界座標が確定せず
+        \emph{一切出力されない}(トラッカ実装は原点確定まで早期リターンする)。原点と
+        対象物・ドローンで ID を重複させない。
+  \item \textbf{校正解像度と運用解像度を一致}: 校正を 1280$\times$720 で行い運用を
+        1920$\times$1080 にすると焦点距離が合わずスケールがずれる。両者を揃える。
+\end{itemize}
+
+\subsection{トラッカの実行と確認}
+\begin{lstlisting}
+cd python
+python run_aruco_tracker.py --config ../configs/aruco_tracker_config.local.json
+# コンソール例:
+#  frame=30 sent=30 detected_ids=[1,2,3,10] markers=4 d0 d1 d2
+#  -> sent が増え、WORLD-FRAME-NOT-SET が消えれば世界座標確定
+\end{lstlisting}
+プレビュー窓の各機 \code{h=} が「床$\approx$0、手で1m上げると$\approx$1.0」になれば校正成功。
+窓が大きすぎる場合は \code{-{}-display-width 960} 等で調整(撮影解像度は不変)。
+
+% =====================================================================
+\section{カメラキャリブレーション手順}
+姿勢推定には正しいカメラ行列 $K$ と歪み係数が必要。\code{calibrate\_camera.py} を使う。
+
+\textbf{(1) ChArUco ボードを生成 $\to$ 等倍(100\%)印刷}:
+\begin{lstlisting}
+cd python
+python calibrate_camera.py --make-board --out-image charuco_board.png
+# 印刷後、チェッカー1マスの一辺を定規で実測する
+\end{lstlisting}
+
+\textbf{(2) 運用と同じ解像度で撮影・校正}:
+\begin{lstlisting}
+python calibrate_camera.py --capture --out configs/camera_calib.npz \
+    --width 1920 --height 1080 \
+    --square-len <実測マス長[m]> --marker-len <実測マス内マーカ[m]>
+# SPACE=取り込み(>=6コーナー), c=校正実行, q=中断。15-25枚集める。
+# 出力の RMS reprojection error が < 1.0 px(できれば <0.5) なら良好。
+\end{lstlisting}
+
+\textbf{(3) マーカ画像生成(必要なら)}:
+\begin{lstlisting}
+python calibrate_camera.py --make-markers --ids 1,2,3,10 --marker-px 600
+# 印刷後に実寸を測り config(marker_length_m / world_marker_length_m) に反映
+\end{lstlisting}
+
+\note{校正の \code{-{}-square-len}/\code{-{}-marker-len} は印刷物の実測値を渡すこと。
+既定値のまま別サイズを印刷するとスケール全体がずれる。}
+
+% =====================================================================
+\section{群制御デモ(取り囲み)}
+
+\subsection{実行}
+\begin{lstlisting}
+cd python
+python run_enclosing_demo.py --config ../configs/pc_real_config.local.json \
+    --center 0 0 --takeoff --duration 30 --R 0.6 --h-ref 0.8
+\end{lstlisting}
+天井カメラ計測で全機位置を得て閉ループでスロット追従し、中心の周りに半径 $R$ の
+正三角形を作る。低レベルは rc のみ(Pi ゲートウェイ経由)。
+
+\subsection{主な制御パラメータ}
+\begin{longtable}{@{}p{3.4cm}p{2.0cm}p{9.6cm}@{}}
+\toprule
+\textbf{引数} & \textbf{既定} & \textbf{意味} \\
+\midrule
+\endhead
+\code{-{}-R} & config & 取り囲み半径[m] \\
+\code{-{}-h-ref} & \code{1.0} & フォーメーション目標高度[m](\code{env.h\_ref})\\
+\code{-{}-center X Y} & --- & 囲む固定点。省略時は ArUco 対象物マーカ \\
+\code{-{}-kp-xy} & \code{0.6} & 水平スロット追従ゲイン \\
+\code{-{}-kp-h} & \code{0.8} & 高度保持ゲイン \\
+\code{-{}-kp-yaw} & \code{0.7} & 対象注視 yaw ゲイン \\
+\code{-{}-v-xy-limit} & \code{0.20} & 水平速度上限[m/s] \\
+\code{-{}-ud-limit} & \code{0.20} & 上下動作上限 \\
+\code{-{}-rate} & \code{10} & 制御レート[Hz] \\
+\code{-{}-min-battery} & \code{20} & 離陸に必要な最低電池[\%] \\
+\code{-{}-d-drone-stop} & \code{0.45} & 機体間の停止距離[m](後述の安全シールド)\\
+\code{-{}-d-drone-warn} & \code{0.60} & 機体間の減衰開始距離[m] \\
+\bottomrule
+\end{longtable}
+
+\note{高度は目標 \code{h\_ref} だが、\code{ud-limit} と Tello の定常偏差により実際は
+やや低め(例 0.7--0.8m)で釣り合うことがある。詰めたいなら \code{-{}-ud-limit}/\code{-{}-kp-h} を上げる。}
+
+\subsection{安全シールド (RealSafetyConfig)}
+\code{real\_safety\_shield.py} が計測状態に基づき rc を制限する。既定値:
+
+\begin{longtable}{@{}p{3.6cm}p{1.8cm}p{9.6cm}@{}}
+\toprule
+\textbf{パラメータ} & \textbf{既定} & \textbf{意味} \\
+\midrule
+\endhead
+\code{d\_drone\_stop} & \code{0.45} & これより近い機体があると停止(\code{drone\_stop})\\
+\code{d\_drone\_warn} & \code{0.60} & 接近方向速度を減衰(\code{drone\_damp})\\
+\code{d\_target\_stop} & \code{0.30} & 中心/対象物への接近停止 \\
+\code{d\_wall\_stop} & \code{0.25} & 領域端の停止 \\
+\code{d\_wall\_warn} & \code{0.45} & 領域端の減衰 \\
+\code{h\_min\_real} & \code{0.45} & 高度下限(下回ると \code{altitude\_low} + 上昇強制)\\
+\code{h\_max\_real} & \code{1.50} & 高度上限(超えると \code{altitude\_high} + 下降強制)\\
+\code{action\_limit} & \code{0.50} & 正規化行動のクリップ \\
+\bottomrule
+\end{longtable}
+
+CLI から機体間距離を変える例(衝突リスクとトレードオフ):
+\begin{lstlisting}
+python run_enclosing_demo.py --config ../configs/pc_real_config.local.json \
+    --center 0 0 --takeoff --R 0.6 --h-ref 0.8 \
+    --d-drone-stop 0.30 --d-drone-warn 0.45
+\end{lstlisting}
+恒久的に変えるなら \code{RealSafetyConfig} の既定値を編集(\code{run\_real\_baseline.py} や
+\code{RealTelloEnv} も同じ既定を参照)。
+
+\subsection{ログの読み方}
+各行 \code{E\_slot}(スロット誤差), \code{E\_R}(半径誤差), \code{E\_edge}(辺長誤差),
+\code{d\_min}(最小機体間距離), \code{h=[min,max]}(高度), 末尾に各機の安全理由。
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{E\_R} 小 かつ \code{E\_slot} 大 = 半径は合うが角度配置が偏り(1箇所に固まる)。
+  \item \code{drone\_stop} 連発 + \code{d\_min} が \code{d\_drone\_stop} 未満 = 近すぎて動けない
+        デッドロック。空間拡大 / 初期配置を三角形に広げる / \code{d-drone-stop} 調整で対処。
+  \item \code{altitude\_low} + \code{h} が 0 付近/負 = その機が地上付近(未離陸)か高さ計測ずれ。
+\end{itemize}
+
+% =====================================================================
+\section{Tello の仕様・状態表示・電源操作}
+\label{sec:tello_spec}
+
+\subsection{対象機体}
+
+本システムで使用する機体は、通常モデルの Tello
+（機体モデル TLW004、非 Tello EDU）である。
+Tello は機体内部に姿勢制御、速度制御、ビジョンポジショニング機能を持ち、
+外部からは Wi-Fi 経由で Tello SDK のテキストコマンドを送信して制御する。
+
+通常モデルの Tello は各機体が Wi-Fi アクセスポイントとして動作し、
+Tello 側の IP アドレスは各機とも \code{192.168.10.1} となる。
+そのため、本システムでは各 Tello に1台の Raspberry Pi を割り当てる。
+
+\subsection{主要仕様}
+
+\begin{longtable}{@{}p{4.0cm}p{4.1cm}p{6.5cm}@{}}
+\toprule
+\textbf{項目} & \textbf{メーカー公称値} & \textbf{本実験での扱い} \\
+\midrule
+\endhead
+機体モデル & TLW004 & 通常版 Tello。Tello EDU 専用機能は前提としない。\\
+重量 & 約80\,g（バッテリー・プロペラを含む）、約87\,g（プロペラガードを含む） & 実験時は安全のためプロペラガードを装着する。\\
+外形寸法 & $98 \times 92.5 \times 41$\,mm & ArUco マーカは重心を大きくずらさず、下方センサを遮らない位置へ固定する。\\
+プロペラ & 3インチ、3044P & マーク付き・マークなしのプロペラを、対応するモータへ正しく取り付ける。\\
+最大速度 & 8\,m/s & 機体の最大性能であり、本実験では水平速度をおおむね0.4\,m/s以下に制限する。\\
+最大飛行時間 & 約13分 & 離陸・ホバリング・通信待ちを含む実験では短くなる。余裕をもって交換する。\\
+最大飛行距離 & 100\,m & 本実験では屋内の数m程度に限定する。\\
+最大飛行高度 & 30\,m & 本実験では安全シールドにより、おおむね0.45--1.50\,mの範囲で運用する。\\
+動作温度 & $0$--$40\,{}^\circ$C & バッテリーやモータが高温の場合は、再飛行前に冷却する。\\
+無線通信 & 2.4--2.4835\,GHz、IEEE 802.11n & 周囲の Wi-Fi アクセスポイントや Bluetooth 機器による干渉に注意する。\\
+搭載センサ & 測距センサ、気圧計、下方ビジョンシステム & SDK の速度・高度だけでは世界座標上の絶対位置は得られないため、群制御では外部計測を用いる。\\
+静止画 & 5\,MP、$2592 \times 1936$、JPEG & 本実験の外部計測には機体前方カメラを使用しない。\\
+動画 & HD 720p、30\,fps、MP4、電子式手ぶれ補正 & 映像ストリームは通信負荷を増やすため、群制御中は原則として無効にする。\\
+カメラ画角 & $82.6^\circ$ & 前方カメラの値であり、下方位置保持センサとは別である。\\
+バッテリー & LiPo、1100\,mAh、3.8\,V、4.18\,Wh & 飛行前に \code{battery?} または state の \code{bat} を確認する。\\
+バッテリー重量 & $25 \pm 2$\,g & 機体ごとのバッテリー交換履歴を記録するとよい。\\
+充電時間 & 約1時間30分 & 機体の電源を切った状態で充電する。\\
+充電可能温度 & $5$--$45\,{}^\circ$C & 飛行直後の高温状態では充電せず、室温付近まで冷却する。\\
+充電端子 & Micro USB & 端子の緩み、ケーブル不良、接触不良を確認する。\\
+\bottomrule
+\end{longtable}
+
+\note{最大速度、最大距離、最大高度、最大飛行時間はメーカーの試験条件に基づく上限値であり、本実験で使用してよい安全値を意味しない。}
+
+\subsection{ビジョンポジショニングシステム}
+
+Tello は機体下面のカメラおよび赤外線測距機能を用いて、床面に対する位置と高度を安定化する。
+ビジョンポジショニングが有効な高度範囲は約0.3--30\,m、特に安定して動作する範囲は
+約0.3--6\,mとされている。
+
+次のような床面や照明条件では位置保持性能が低下する。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item 無地の白・黒・赤・緑など、模様や特徴点が少ない床面
+  \item 光沢面、鏡面、水面、透明な面
+  \item 同じ模様が周期的に繰り返される床面
+  \item 動いている床面や物体の上
+  \item 非常に暗い場所、または強い光が直接入る場所
+  \item 下方カメラまたは赤外線センサが汚れている場合
+  \item 高度が低い状態で高速移動する場合
+\end{itemize}
+
+ビジョンポジショニングが利用できなくなると、Tello は Attitude mode（ATTI モード）へ移行する。
+この状態では水平位置を保持できず、わずかな気流や慣性によって機体が流れる。
+インジケータが黄色でゆっくり点滅している場合は原則として離陸せず、飛行中であれば安全に着陸させる。
+
+本実験では床面に十分な模様を設け、照明を一定にし、外部 ArUco 計測が正常であっても
+Tello 内部の位置保持条件を満たすようにする。
+
+\subsection{Tello SDK の通信仕様}
+
+\begin{longtable}{@{}p{4.0cm}p{3.0cm}p{7.6cm}@{}}
+\toprule
+\textbf{用途} & \textbf{ポート・値} & \textbf{内容} \\
+\midrule
+\endhead
+SDK コマンド・応答 & UDP 8889 & \code{command}、\code{takeoff}、\code{land}、\code{rc}、\code{battery?} などを送受信する。\\
+機体状態ストリーム & UDP 8890 & 姿勢角、速度、高度、ToF、バッテリー残量、温度、気圧、加速度などを受信する。\\
+映像ストリーム & UDP 11111 & \code{streamon} 送信後に映像を受信する。本システムでは通常使用しない。\\
+Tello 側 IP & \code{192.168.10.1} & 通常版 Tello は各機体で同じ IP を使用する。\\
+RC 指令 & \code{rc a b c d} & 左右、前後、上下、yaw の4成分。各値の範囲は$-100$--$100$。\\
+バッテリー照会 & \code{battery?} & バッテリー残量を0--100の整数で返す。\\
+\bottomrule
+\end{longtable}
+
+Tello SDK では、他のコマンドを送る前に \code{command} を送信して SDK モードへ入れる必要がある。
+また、飛行中に約15秒間コマンドを受信しない場合、Tello は安全機能として自動着陸する。
+したがって制御中は RC 指令を継続して送信し、本システムでは Raspberry Pi 側の watchdog も併用する。
+
+\warning{UDP はパケットの到着、順序、重複排除を保証しない。特に \code{battery?}、\code{takeoff}、\code{land} の応答を同じ受信ソケットで扱う場合は、要求と応答の対応を直列化する必要がある。}
+
+\subsection{インジケータランプの意味}
+
+Tello の機体状態インジケータは機体前面のカメラ横にあり、飛行制御システム、
+ビジョンポジショニング、通信、バッテリーおよび充電状態を示す。
+
+\begin{longtable}{@{}p{2.2cm}p{4.0cm}p{4.7cm}p{4.0cm}@{}}
+\toprule
+\textbf{分類} & \textbf{色・点灯パターン} & \textbf{意味} & \textbf{本実験での対応} \\
+\midrule
+\endhead
+通常 & 赤・緑・黄が交互に点滅 & 起動中・自己診断中 & 点滅が終わるまで機体を動かさず、操作しない。\\
+通常 & 緑色が周期的に2回点滅 & ビジョンポジショニング有効 & 基本的な飛行準備状態。通信、バッテリー、外部計測も別途確認する。\\
+通常 & 黄色がゆっくり点滅 & ビジョンポジショニング無効、ATTI モード & 離陸しない。床面、照明、下方センサを確認する。\\
+警告 & 黄色が速く点滅 & 制御信号の喪失 & Pi--Tello 間の Wi-Fi、SDK 通信、gateway を確認する。\\
+警告 & 赤色がゆっくり点滅 & バッテリー残量低下 & 新しい飛行を開始せず、飛行中なら早めに着陸する。\\
+警告 & 赤色が速く点滅 & バッテリー残量が極めて低い & 離陸しない。飛行中なら直ちに着陸する。\\
+警告 & 赤色が点灯 & 重大なエラー & 飛行を中止し、電源を切って機体、プロペラ、モータを点検する。\\
+充電 & 青色がゆっくり点滅 & 充電中 & 機体の電源を切ったまま待つ。\\
+充電 & 青色が点灯 & 充電完了 & USB ケーブルを外す。\\
+充電 & 青色が速く点滅 & 充電エラー & 充電を中止し、温度、ケーブル、USB 電源、バッテリーを確認する。\\
+\bottomrule
+\end{longtable}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item 緑色の2回点滅はビジョンポジショニングが有効であることを示すが、Raspberry Pi や SDK との通信が正常であることまでは示さない。
+  \item 通信状態は、インジケータだけでなく \code{python -m tello\_fleet status}、state stream、\code{battery?} の応答を併用して確認する。
+  \item 赤色の高速点滅は、公式上はバッテリー残量が極めて低い状態を表し、「前回のプログラム状態が残っている」ことを直接示す表示ではない。
+  \item ランプ表示と \code{battery?} が矛盾する場合は再離陸せず、state stream の \code{bat}、gateway ログ、応答の対応関係を再確認する。
+  \item 周囲が明るいと赤色と黄色、点灯と高速点滅を見分けにくいため、必要に応じて動画で点滅周期を確認する。
+\end{itemize}
+
+\subsection{Tello の電源操作}
+\label{subsec:tello_power}
+
+\subsubsection{電源を入れる前の確認}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item フライトバッテリーが十分に充電され、機体の奥まで確実に挿入されている。
+  \item プロペラに欠け、曲がり、緩みがなく、プロペラガードが正しく装着されている。
+  \item 下方カメラと赤外線センサが、マーカ、テープ、ケーブルなどで遮られていない。
+  \item ArUco マーカが確実に固定され、機体番号、マーカ ID、対応する Raspberry Pi が一致している。
+  \item 機体が水平で、十分な模様のある平らな床面に置かれている。
+\end{itemize}
+
+\warning{電源投入時および自己診断中は機体を動かさない。傾いた状態や手に持った状態で起動すると、姿勢推定やセンサ初期化に影響する可能性がある。}
+
+\subsubsection{電源の入れ方}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Tello を所定の初期位置に水平に置く。
+  \item 機体側面の電源ボタンを短く1回押し、すぐに離す。
+  \item 機体前面のインジケータが赤・緑・黄に交互点滅し、自己診断を開始することを確認する。
+  \item 自己診断が完了するまで機体に触れずに待つ。
+  \item インジケータが緑色で定期的に2回点滅することを確認する。
+  \item 対応する Raspberry Pi が Tello の Wi-Fi に接続するまで待つ。
+\end{enumerate}
+
+\note{複数機を使用するときは Tello-1、Tello-2、Tello-3 の順に1台ずつ電源を入れ、その都度、対応する Raspberry Pi が正しい \code{TELLO-XXXXXX} に接続したことを確認すると、機体の取り違えを防げる。}
+
+\warning{電源ボタンを約5秒間長押しすると、通常の電源操作ではなく、Tello の Wi-Fi SSID とパスワードのリセット処理が始まる。通常の実験準備では長押ししない。}
+
+\subsubsection{電源の切り方}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Tello が完全に着陸したことを目視で確認する。
+  \item 全プロペラが完全に停止したことを確認する。
+  \item 制御プログラムから追加の離陸・RC 指令が送られない状態にする。
+  \item 機体側面の電源ボタンを短く1回押す。
+  \item インジケータが消灯したことを確認する。
+\end{enumerate}
+
+\warning{飛行中、着陸途中、またはプロペラ回転中には、通常の終了操作として電源を切らない。まず \code{land} または安全着陸処理を実行する。}
+
+\subsection{本システム固有の運用上の制約}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{地上待機中の自動電源オフ}: 標準版 Tello は地上待機が長いと省電力のため電源が切れることがある。keepalive は SDK/Wi-Fi 維持に有効だが、地上待機中の電源オフを完全には防げない場合があるため、実験開始直前に電源を入れる。
+  \item \textbf{SDK 無通信で自動着陸}: 飛行中に一定時間コマンドが来ないと自動着陸する。制御中は RC 指令を送り続け、Pi watchdog を補助として用いる。
+  \item \textbf{takeoff 応答の欠落}: \code{ok} 応答が受信できなくても実際には離陸している場合がある。応答文字列だけでなく、外部計測高度と state stream を併用して成否を判定する。
+  \item \textbf{離着陸直後の再実行}: 着陸直後に再度 \code{takeoff} を送ると失敗する場合がある。LED、バッテリー、state stream を確認し、機体内部状態が落ち着いてから再実行する。
+  \item \textbf{個体差}: 同じ RC 指令値でも速度、上昇量、停止距離に個体差がある。機体ごとに低速指令でキャリブレーションする。
+\end{itemize}
+
+% =====================================================================
+\section{実験装置の準備・立ち上げ・終了手順}
+\label{sec:experiment_startup}
+
+\subsection{対象とする装置構成}
+
+本節では、母艦 PC、Ethernet スイッチングハブ、Raspberry Pi 3台、通常版 Tello 3台、
+天井カメラ、ArUco 原点・機体マーカを使用する実機実験を対象とする。
+各 Raspberry Pi の \code{tello-gateway.service} は起動時に systemd により自動実行される。
+Tello の電源が入っていない間は link down の状態で待機し、対応する Tello が接続されると通信を再開する。
+
+\subsection{実験前の物理的な準備}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item 飛行領域から人、椅子、ケーブル、工具などを退避させる。
+  \item 安全ネットおよび立入禁止範囲を設定する。
+  \item 原点マーカを所定の位置に固定する。
+  \item 各 Tello を所定の初期位置へ置く。
+  \item 各 Tello の機体番号、ArUco ID、対応 Pi を確認する。
+  \item 各機の前方方向を初期 yaw の設定と合わせる。
+  \item プロペラ、プロペラガード、バッテリー、マーカを点検する。
+  \item 緊急時に全機を着陸させる担当者を決める。
+\end{enumerate}
+
+\warning{飛行領域内で作業している間は Tello の電源を入れない。マーカ調整や機体位置調整が完了してから電源を入れる。}
+
+\subsection{推奨する装置の起動順序}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Ethernet スイッチングハブの電源を入れる。
+  \item 母艦 PC を起動する。
+  \item PC、各 Raspberry Pi、スイッチングハブを Ethernet で接続する。
+  \item 各 Raspberry Pi の電源を入れる。
+  \item Raspberry Pi の起動と systemd サービスの開始を待つ。
+  \item 外部計測カメラを接続し、トラッカを起動する。
+  \item マーカ認識、座標、高度、yaw を確認する。
+  \item 飛行直前に各 Tello の電源を1台ずつ入れる。
+  \item Pi--Tello 接続と gateway の状態を確認する。
+  \item PC から非飛行の通信診断を行う。
+  \item ライブ監視を開始する。
+  \item 最終安全確認後に飛行プログラムを実行する。
+\end{enumerate}
+
+\note{Tello は地上で長時間待機すると電源が切れることがあるため、実験室の準備開始時ではなく、外部計測と PC 側プログラムの準備が完了した後に電源を入れる。}
+
+\subsection{Raspberry Pi の起動確認}
+
+各 Raspberry Pi の電源を入れた後、母艦 PC の PowerShell から有線 LAN 側への到達性を確認する。
+
+\begin{lstlisting}
+ping 192.168.50.101
+ping 192.168.50.102
+ping 192.168.50.103
+\end{lstlisting}
+
+通常運用では gateway は systemd により自動起動するため、毎回手動で \code{tello\_gateway.py} を実行する必要はない。
+必要な場合だけ SSH 接続して状態を確認する。
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+systemctl status tello-gateway --no-pager
+systemctl is-enabled tello-gateway
+journalctl -u tello-gateway -n 50 --no-pager
+\end{lstlisting}
+
+正常時は \code{Active: active (running)}、\code{enabled}、TCP port 10000 の待受を確認する。
+Tello 電源投入後も link が復帰しない場合は Pi 上で次を確認する。
+
+\begin{lstlisting}
+iwgetid
+ip addr show wlan0
+ip route get 192.168.10.1
+ping -c 3 192.168.10.1
+journalctl -u tello-gateway -f
+\end{lstlisting}
+
+必要な場合は gateway を再起動する。
+
+\begin{lstlisting}
+sudo systemctl restart tello-gateway
+\end{lstlisting}
+
+\warning{systemd サービスが動作中の状態で、別の \code{tello\_gateway.py} を手動起動しない。TCP port や Tello SDK の UDP socket が競合する可能性がある。}
+
+\subsection{母艦 PC の PowerShell 準備}
+
+実験時は、少なくとも次の3つの PowerShell 画面を使用する。
+
+\begin{longtable}{@{}p{2.0cm}p{4.3cm}p{7.9cm}@{}}
+\toprule
+\textbf{画面} & \textbf{用途} & \textbf{実行するプログラム} \\
+\midrule
+\endhead
+A & 外部計測 & \code{run\_aruco\_tracker.py} \\
+B & Pi・Tello 状態監視 & \code{pi\_monitor.py} \\
+C & 通信診断・群制御 & \code{python -m tello\_fleet doctor/status}、\code{run\_enclosing\_demo.py} \\
+D（任意） & Pi ログ確認 & SSH および \code{journalctl -f} \\
+\bottomrule
+\end{longtable}
+
+各 PowerShell 画面で作業ディレクトリへ移動し、Python 仮想環境を有効化する。
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+\end{lstlisting}
+
+\note{\code{Set-ExecutionPolicy -Scope Process} の設定は、その PowerShell 画面を閉じると元に戻る。新しく開いた PowerShell では仮想環境を再度有効化する。}
+
+\subsection{外部計測の起動と確認}
+
+PowerShell A で ArUco トラッカを起動する。
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+.\venv\Scripts\Activate.ps1
+python run_aruco_tracker.py --config ../configs/aruco_tracker_config.local.json
+\end{lstlisting}
+
+次を確認する。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item 原点マーカが認識されている。
+  \item Tello 1、2、3 のマーカ ID がすべて認識されている。
+  \item ID と実際の機体番号が一致している。
+  \item 床上の機体の高度がほぼ0\,mである。
+  \item 機体を既知の高さへ持ち上げたとき、高度が実寸と一致する。
+  \item $x$軸、$y$軸、yaw の正方向が設定と一致する。
+  \item 値が途切れず、更新時刻が進み続けている。
+\end{itemize}
+
+\warning{高度、機体 ID、原点、yaw のいずれかが不正な状態では、Tello の電源を入れても飛行実験へ進まない。}
+
+\subsection{Tello の電源投入と Pi--Tello 接続確認}
+
+外部計測が正常で、飛行領域内の作業が終了してから Tello の電源を入れる。
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Tello-1 の電源ボタンを短く1回押す。
+  \item 自己診断が終わり、緑色の2回点滅になるまで待つ。
+  \item Pi-1 が Tello-1 の Wi-Fi に接続したことを確認する。
+  \item 同じ手順を Tello-2、Tello-3 に対して行う。
+  \item 全機についてインジケータ、機体番号、ArUco ID を再確認する。
+\end{enumerate}
+
+Pi 上で直接確認する場合は次を用いる。
+
+\begin{lstlisting}
+iwgetid
+ip route get 192.168.10.1
+\end{lstlisting}
+
+\subsection{PC からの通信診断}
+
+全 Tello の電源を入れた後、PowerShell C で次を実行する。
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+.\venv\Scripts\Activate.ps1
+python -m tello_fleet doctor --config ../configs/pc_real_config.local.json
+python -m tello_fleet status --config ../configs/pc_real_config.local.json
+\end{lstlisting}
+
+全機について次を確認する。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Raspberry Pi が \code{UNREACHABLE} ではない。
+  \item Tello link が \code{UP} である。
+  \item SDK mode が有効である。
+  \item state stream の age が小さい。
+  \item バッテリー値が取得でき、実験開始条件を満たしている。
+  \item \code{doctor} が終了コード0で完了する。
+\end{itemize}
+
+\warning{1機でも ready でない場合は飛行しない。その機だけを除外して、予定外の機数で実験を続けない。}
+
+\subsection{ライブ監視の起動}
+
+PowerShell B でライブ監視を起動する。
+
+\begin{lstlisting}
+cd C:\Users\inulab\Work\Tello-drone\python
+.\venv\Scripts\Activate.ps1
+python pi_monitor.py --config ../configs/pc_real_config.local.json
+\end{lstlisting}
+
+監視画面は飛行中も閉じず、リンク切断、バッテリー低下、state 更新停止が発生していないか確認する。
+
+\subsection{飛行直前チェック}
+
+飛行プログラムを開始する直前に、声に出して次を確認する。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item 飛行領域内に人がいない。
+  \item 安全ネットおよび立入禁止範囲が設定されている。
+  \item 全機のプロペラガードが装着されている。
+  \item 全機のインジケータが緑色の2回点滅である。
+  \item \code{fleet doctor} が全機 ready を示している。
+  \item 外部計測が全機を認識している。
+  \item 機体 ID、Pi ID、ArUco ID の対応が一致している。
+  \item 初期位置と初期 yaw が設定と一致している。
+  \item 最小機体間距離が安全距離以上である。
+  \item 取り囲み半径 $R$ と高度 \code{h-ref} が飛行領域内に収まる。
+  \item PowerShell A、B、C が確認できる位置にある。
+  \item 緊急着陸操作を行う担当者が待機している。
+\end{itemize}
+
+\subsection{群制御実験の開始}
+
+全確認が完了した後、PowerShell C で実験プログラムを実行する。
+
+\begin{lstlisting}
+python run_enclosing_demo.py --config ../configs/pc_real_config.local.json \
+    --center 0 0 --takeoff --duration 30 --R 0.6 --h-ref 0.8
+\end{lstlisting}
+
+\warning{上記の \code{R}、\code{h-ref}、\code{duration} は実行例である。実験室寸法、カメラ視野、初期位置、安全距離に合わせて設定する。}
+
+最初の実験では次の順に段階的に進める。
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item 非飛行の通信診断
+  \item 1機の短時間離陸・ホバリング・着陸
+  \item 3機の同時離陸・ホバリング・着陸
+  \item 低速・短時間の正三角形形成
+  \item 実験時間または対象物運動を段階的に増やす
+\end{enumerate}
+
+\subsection{外部計測なしデモを行う場合}
+
+外部計測なしの基盤確認では、\code{run\_aruco\_tracker.py} と \code{run\_enclosing\_demo.py} は使用しない。
+Tello 電源投入と \code{fleet doctor} の確認後、まず非飛行の Demo 1 を実行する。
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_01_comm_check.py \
+    --config ..\configs\no_tracker_demo_config.local.json --repeat 3
+\end{lstlisting}
+
+全機で \code{command=ok} とバッテリー値が得られた後に、短時間の離陸・ホバリング・着陸へ進む。
+
+\begin{lstlisting}
+python .\no_tracker_demos\demo_02_takeoff_hover_land.py \
+    --config ..\configs\no_tracker_demo_config.local.json \
+    --duration 8 --rate-hz 10 --yes
+\end{lstlisting}
+
+\warning{外部計測なしでは水平ドリフトと機体間距離を正確に補正できない。十分な間隔を取り、基盤確認では水平移動を伴う実験を行わない。}
+
+\subsection{通常の実験終了手順}
+
+実験終了時は次の順序で停止する。
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item 制御プログラムの終了処理により全機へ \code{land} を送る。
+  \item 全機が床面へ着陸したことを目視で確認する。
+  \item 全機のプロペラが完全に停止したことを確認する。
+  \item ログに全機の着陸完了が記録されていることを確認する。
+  \item 各 Tello の電源を切る。
+  \item PowerShell B の \code{pi\_monitor.py} を \code{Ctrl+C} で停止する。
+  \item PowerShell A の \code{run\_aruco\_tracker.py} を \code{Ctrl+C} で停止する。
+  \item ログファイルを実験日時、条件、機体番号とともに保存する。
+  \item Raspberry Pi を使用しない場合は、安全にシャットダウンする。
+  \item スイッチングハブ、カメラ、PC の電源を切る。
+\end{enumerate}
+
+Raspberry Pi を停止する場合は、各 Pi に SSH 接続して \code{sudo poweroff} を実行する。
+
+\begin{lstlisting}
+ssh inulab@192.168.50.101
+sudo poweroff
+# Pi-2、Pi-3 についても同様に実行する
+\end{lstlisting}
+
+アクセス LED の点滅が止まり、十分に待ってから Raspberry Pi の電源ケーブルを抜く。
+
+\warning{Raspberry Pi の OS が動作している状態で電源ケーブルを直接抜かない。ファイルシステムやログが破損する可能性がある。}
+
+\subsection{異常発生時の終了手順}
+
+飛行中に次のいずれかが発生した場合は、通常の実験継続よりも全機着陸を優先する。
+
+\begin{itemize}[leftmargin=1.4em]
+  \item 外部計測が1機でも途絶した。
+  \item Tello link が1機でも down になった。
+  \item state stream の更新が停止した。
+  \item 機体 ID と計測 ID の対応に疑いが生じた。
+  \item 機体間距離が緊急距離を下回った。
+  \item 1機が予定外の方向へ大きく移動した。
+  \item 高度が安全範囲を逸脱した。
+  \item 赤色の警告インジケータが確認された。
+  \item 操作者が安全に実験を継続できないと判断した。
+\end{itemize}
+
+異常着陸後は原因が判明するまで再離陸しない。バッテリー、インジケータ、gateway ログ、
+外部計測ログ、制御ログを確認し、最初の非飛行診断からやり直す。
+
+% =====================================================================
+\section{トラブルシューティング集(実際に遭遇した事例)}\label{sec:trouble}
+
+\begin{longtable}{@{}p{4.4cm}p{4.2cm}p{6.0cm}@{}}
+\toprule
+\textbf{症状} & \textbf{原因} & \textbf{対処} \\
+\midrule
+\endhead
+systemd が再起動ループ。\code{No such file '/home/raspberry\_pi/tello\_gateway.py'} &
+初期版がリポジトリ構造からパスを自動検出し、置き場所によって誤解決 &
+固定配置(\code{/opt/tello-gateway})方式に変更。ソースを再送し \code{install.sh} 再実行 \\
+\addlinespace
+起動直後にクラッシュ \code{OSError [Errno 101] Network is unreachable} &
+起動時 \code{command} 送信時に wlan0 が Tello 未接続(経路なし) &
+\code{send\_tello} が送信失敗を握りつぶし空応答に。Tello 接続で自動復帰(修正済) \\
+\addlinespace
+\code{sudo: ホスト名の名前解決ができません} &
+\code{/etc/hosts} に自ホスト名が無い &
+\code{echo "127.0.1.1 inulab-rpi-01" | sudo tee -a /etc/hosts}(sudo の遅延も解消) \\
+\addlinespace
+keepalive しているのに Tello が数分で落ちる &
+(a) \code{status} ポーリングが keepalive を抑制していた / (b) Tello の仕様 &
+(a) は \code{\_last\_send\_time} 基準に修正済。(b) は飛ばす直前に電源 ON \\
+\addlinespace
+トラッカの高度が 11--15m 等あり得ない値 $\to$ 安全シールドが緊急着陸 &
+\code{world\_marker\_length\_m} の実寸ずれ / 校正解像度(1280$\times$720)と運用(1920$\times$1080)の不一致 &
+マーカ実寸を反映 + 運用解像度で校正やり直し。プレビューで h を実寸確認 \\
+\addlinespace
+\code{markers=0 / WORLD-FRAME-NOT-SET} で出力ゼロ &
+\code{world\_marker\_id} が実在しない ID(例 11)を指す &
+視野内の実在原点マーカの ID に合わせる。\code{detected\_ids} で確認 \\
+\addlinespace
+\code{detected\_ids=[]}(何も検出しない) &
+ピンボケ/露出過多、辞書不一致(非 DICT\_4X4\_50)、カメラ番号違い &
+ピント・露出・辞書・\code{-{}-camera} を確認 \\
+\addlinespace
+プレビュー窓が画面より大きく見切れる &
+撮影解像度そのままで表示 &
+\code{WINDOW\_NORMAL}+リサイズ対応済。\code{-{}-display-width} で調整 \\
+\addlinespace
+\code{drone\_stop} 連発でフォーメーション未収束 &
+狭い空間 + 小さい R で機体間が安全距離未満のデッドロック &
+空間拡大 / R・h-ref 調整 / 初期配置を広げる / \code{-{}-d-drone-stop} 調整 \\
+\addlinespace
+1 機だけ \code{altitude\_low}(h$\approx$0/負) &
+その機が未離陸 or 高さ計測ずれ &
+実機/プレビューで浮遊確認。飛んでいるのに h$\approx$0 ならその機のマーカ高さ校正 \\
+\addlinespace
+ドローンがフレームアウト &
+高度が高いほど天井カメラの水平視野が狭い + R が大きい &
+\code{-{}-R} を小さく / \code{-{}-h-ref} を下げる / カメラを高く・広角に \\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{コマンド早見表}
+
+\subsection{ラズパイ(各 Pi 上)}
+\begin{lstlisting}
+sudo bash ~/install.sh                 # 設置 / 更新
+systemctl status  tello-gateway        # 稼働確認
+systemctl is-enabled tello-gateway     # 自動起動確認 (enabled)
+journalctl -u tello-gateway -f         # ログ追尾 (LINK UP/LOST, alive)
+sudo systemctl restart tello-gateway   # 再起動
+sudo systemctl stop    tello-gateway   # 手動制御のため停止
+\end{lstlisting}
+
+\subsection{母艦PC(PowerShell / venv)}
+\begin{lstlisting}
+# 送信(コード更新)
+cd C:\Users\inulab\Work\Tello-drone\raspberry_pi
+scp install.sh tello_gateway.py tello-gateway.service inulab@192.168.50.101:/home/inulab/
+
+# 監視 / チェック
+cd C:\Users\inulab\Work\Tello-drone\python
+python -m tello_fleet doctor --config ../configs/pc_real_config.local.json
+python -m tello_fleet status --config ../configs/pc_real_config.local.json
+python pi_monitor.py --config ../configs/pc_real_config.local.json
+
+# 外部計測 -> 群制御
+python run_aruco_tracker.py --config ../configs/aruco_tracker_config.local.json
+python run_enclosing_demo.py --config ../configs/pc_real_config.local.json \
+    --center 0 0 --takeoff --duration 30 --R 0.6 --h-ref 0.8
+\end{lstlisting}
+
+\subsection{標準的な立ち上げ順序}
+詳細は第\ref{sec:experiment_startup}節を参照する。要点は次の通りである。
+\begin{enumerate}[leftmargin=1.6em]
+  \item 物理配置と安全設備を準備し、ハブ、PC、各 Pi の順に起動する。
+  \item \code{run\_aruco\_tracker.py} を起動し、原点・機体 ID・高度・yaw を確認する。
+  \item 飛行直前に Tello を1台ずつ電源 ONし、対応する Pi との接続を確認する。
+  \item \code{fleet doctor} と \code{status} で全機 ready を確認し、\code{pi\_monitor.py} を起動する。
+  \item 飛行直前チェック後に \code{run\_enclosing\_demo.py} を実行する。
+\end{enumerate}
+
+% =====================================================================
+\section{ディレクトリ構成(抜粋)}
+\begin{lstlisting}
+Tello-drone/
+  raspberry_pi/
+    tello_gateway.py          # Pi 常駐ゲートウェイ
+    tello-gateway.service     # systemd ユニット(固定 /opt パス)
+    install.sh                # /opt へ設置・enable・起動
+  python/
+    tello_fleet/              # DroneClient / Fleet / CLI (status,doctor)
+    pi_monitor.py             # 全機ライブ監視
+    run_aruco_tracker.py      # ArUco 外部計測(UDP送信)
+    calibrate_camera.py       # カメラ校正 + マーカ/ボード生成
+    run_enclosing_demo.py     # 取り囲み群制御デモ
+    run_real_baseline.py      # PDベースライン実機実行
+    tello_rl/real/            # RealTelloEnv, トラッカ受信, 安全シールド, ArUco
+    no_tracker_demos/         # トラッカ無し基礎デモ
+  configs/
+    pc_real_config.local.json         # 制御側(pi_hosts / tracker / env)
+    aruco_tracker_config.local.json   # トラッカ(カメラ/aruco/ids/output)
+    camera_calib.npz(= python/configs/)# カメラ内部パラメータ
+  docs/
+    gateway_deployment.md     # ゲートウェイ配備手順(Markdown)
+    tello_system_handbook.tex # 本書
+\end{lstlisting}
+
+% =====================================================================
+\section{本システムで実装した主な変更(履歴)}
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{フェーズ1}: ゲートウェイを常駐セッション所有者化。keepalive、リンク死活
+        (LINK LOST/RESTORED)、\code{status} 拡張、60s ハートビート、systemd 自動起動
+        (固定 \code{/opt} 配置)、\code{install.sh}、PC 監視 \code{pi\_monitor.py}。
+  \item \textbf{フェーズ2}: PC クライアントを \code{tello\_fleet} に一本化(\code{DroneClient}/
+        \code{Fleet}/CLI \code{status}/\code{doctor})。旧クライアントは別名 shim 化。テレメトリ
+        途絶時の全機 land ポリシーを \code{RealTelloEnv} に実装。
+  \item \textbf{堅牢化}: 起動時 \code{command} の \code{Network unreachable} を握りつぶし、keepalive
+        ゲーティングを \code{\_last\_send\_time} 基準に修正。
+  \item \textbf{計測支援}: トラッカのプレビュー窓リサイズ、\code{detected\_ids}/世界座標状態の
+        表示、機体間安全距離の CLI 化(\code{-{}-d-drone-stop}/\code{-{}-d-drone-warn})。
+\end{itemize}
+
+\vfill
+\begin{center}\small 以上。更新時は本 \code{.tex} と \code{docs/gateway\_deployment.md} を併せて改訂すること。\end{center}
+
+\end{document}

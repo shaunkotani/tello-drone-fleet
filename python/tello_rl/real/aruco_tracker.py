@@ -103,6 +103,10 @@ class ArucoTrackerConfig:
     # ID 割り当て: drones[k] の ArUco ID をドローン index k に対応させる
     drone_ids: List[int] = field(default_factory=lambda: [0, 1, 2])
     target_id: Optional[int] = 5
+    # 視野四隅に常設するマーカの ID (4 つ)。設定すると床上の視野範囲と
+    # カメラ位置を "bounds" として UDP ペイロードに同梱する。
+    corner_ids: List[int] = field(default_factory=list)
+    corner_marker_length_m: Optional[float] = None  # 四隅マーカの一辺 (既定 marker_length_m)
 
     # 保存済み外部パラメータ (world<-camera)。world_marker を使わないとき必須。
     R_wc: Optional[List[List[float]]] = None
@@ -143,6 +147,8 @@ class ArucoTrackerConfig:
             world_marker_length_m=_opt_float(ar.get("world_marker_length_m")),
             drone_ids=[int(x) for x in ids.get("drones", [0, 1, 2])],
             target_id=_opt_int(ids.get("target", 5)),
+            corner_ids=[int(x) for x in ids.get("corners", [])],
+            corner_marker_length_m=_opt_float(ar.get("corner_marker_length_m")),
             R_wc=ext.get("R_wc"),
             t_wc=ext.get("t_wc"),
             pos_ema=float(sm.get("pos_ema", 0.5)),
@@ -333,10 +339,14 @@ class ArucoTracker:
             t_wc=None if cfg.t_wc is None else np.asarray(cfg.t_wc, dtype=float),
         )
         self.world_len = cfg.world_marker_length_m or cfg.marker_length_m
+        self.corner_len = cfg.corner_marker_length_m or cfg.marker_length_m
         self.drone_sm = {i: _Smoother(cfg.pos_ema, cfg.vel_ema) for i in range(len(cfg.drone_ids))}
         self.target_sm = _Smoother(cfg.pos_ema, cfg.vel_ema)
         # ArUco ID -> ドローン index
         self.id_to_drone = {int(mid): idx for idx, mid in enumerate(cfg.drone_ids)}
+        # 視野四隅マーカ: 静止物なので逐次平均した床位置 (world xy) を保持
+        self.corner_pos: Dict[int, np.ndarray] = {}
+        self.corner_n: Dict[int, int] = {}
 
     def process_frame(self, frame: np.ndarray, stamp: Optional[float] = None
                       ) -> Tuple[Optional[Dict[str, Any]], Dict[int, Tuple[np.ndarray, np.ndarray]]]:
@@ -367,13 +377,24 @@ class ArucoTracker:
                 continue
             is_drone = mid in self.id_to_drone
             is_target = (self.cfg.target_id is not None and mid == self.cfg.target_id)
-            if not (is_drone or is_target):
+            is_corner = mid in self.cfg.corner_ids
+            if not (is_drone or is_target or is_corner):
                 continue
-            rvec, tvec = estimate_pose_single(corners, self.cfg.marker_length_m, self.intr)
+            length = self.corner_len if is_corner else self.cfg.marker_length_m
+            rvec, tvec = estimate_pose_single(corners, length, self.intr)
             poses[mid] = (rvec, tvec)
             pos_w, R_wm = self.world.transform(rvec, tvec)
             r, h, yaw = pose_to_state(pos_w, R_wm)
-            if is_drone:
+            if is_corner:
+                # 上限つき逐次平均 (収束後もゆっくり追従し、外れ値 1 発では動かない)
+                n = self.corner_n.get(mid, 0)
+                if n == 0:
+                    self.corner_pos[mid] = r.copy()
+                else:
+                    w = 1.0 / float(min(n, 100) + 1)
+                    self.corner_pos[mid] = (1.0 - w) * self.corner_pos[mid] + w * r
+                self.corner_n[mid] = n + 1
+            elif is_drone:
                 idx = self.id_to_drone[mid]
                 self.drone_sm[idx].update_seen(r, h, yaw, stamp)
                 seen_drones.add(idx)
@@ -419,7 +440,17 @@ class ArucoTracker:
             }
         else:
             target = {"r": [0.0, 0.0], "v": [0.0, 0.0], "seen": False, "age": float("inf")}
-        return {"t": float(stamp), "drones": drones, "target": target}
+        payload: Dict[str, Any] = {"t": float(stamp), "drones": drones, "target": target}
+        # 視野四隅が全て観測済みなら、床上の視野範囲とカメラ位置を同梱する。
+        # 受信側 (PC) はこれとカメラ高から任意高度での実効視野を計算できる。
+        if self.cfg.corner_ids and all(mid in self.corner_pos for mid in self.cfg.corner_ids):
+            t_wc = self.world.t_wc
+            payload["bounds"] = {
+                "corners": [[float(self.corner_pos[mid][0]), float(self.corner_pos[mid][1])]
+                            for mid in self.cfg.corner_ids],
+                "camera": [float(t_wc[0]), float(t_wc[1]), float(t_wc[2])],
+            }
+        return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -452,12 +483,20 @@ def draw_overlay(frame: np.ndarray, tracker: ArucoTracker,
     """検出マーカの軸と推定状態を描画する (デバッグ用)。"""
     intr = tracker.intr
     for mid, (rvec, tvec) in poses.items():
-        length = tracker.world_len if mid == tracker.cfg.world_marker_id else tracker.cfg.marker_length_m
+        if mid == tracker.cfg.world_marker_id:
+            length = tracker.world_len
+        elif mid in tracker.cfg.corner_ids:
+            length = tracker.corner_len
+        else:
+            length = tracker.cfg.marker_length_m
         cv2.drawFrameAxes(frame, intr.K, intr.dist, rvec.reshape(3, 1), tvec.reshape(3, 1),
                           length * 0.5, 2)
     lines = []
     if not tracker.world.valid:
         lines.append("world frame: NOT set (show reference marker)")
+    if tracker.cfg.corner_ids:
+        n_seen = sum(1 for m in tracker.cfg.corner_ids if m in tracker.corner_pos)
+        lines.append("fov corners: {}/{}".format(n_seen, len(tracker.cfg.corner_ids)))
     if payload is not None:
         for d in payload["drones"]:
             tag = "" if d["seen"] else " [stale]"

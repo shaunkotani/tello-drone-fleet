@@ -66,6 +66,14 @@ class TrackerFrame:
     target: RealTargetState
 
 
+@dataclass
+class TrackerBounds:
+    """カメラ視野の床上四隅とカメラ位置 (aruco_tracker の "bounds" フィールド)。"""
+    corners: np.ndarray  # (M,2) 床レベルでの視野四隅 [m] (通常 M=4)
+    camera: np.ndarray   # (3,) カメラ位置 [cx, cy, Hc] [m]
+    stamp: float = 0.0
+
+
 class UdpJsonTracker:
     """Receive real-time pose estimates from an external UDP JSON tracker.
 
@@ -85,6 +93,7 @@ class UdpJsonTracker:
         self._running = threading.Event()
         self._lock = threading.Lock()
         self._latest: Optional[TrackerFrame] = None
+        self._latest_bounds: Optional[TrackerBounds] = None
         self._prev_drones: Dict[int, RealDroneState] = {}
         self._prev_target: Optional[RealTargetState] = None
 
@@ -123,12 +132,15 @@ class UdpJsonTracker:
             try:
                 msg = json.loads(data.decode("utf-8"))
                 frame = self._parse_frame(msg)
+                bounds = self._parse_bounds(msg, frame.stamp)
             except Exception:
                 # Ignore malformed frames.  The control loop will timeout if no good
                 # frame arrives.
                 continue
             with self._lock:
                 self._latest = frame
+                if bounds is not None:
+                    self._latest_bounds = bounds
 
     def _parse_frame(self, msg: Dict[str, Any]) -> TrackerFrame:
         stamp = float(msg.get("t", time.time()))
@@ -186,6 +198,34 @@ class UdpJsonTracker:
         target = RealTargetState(tr, tv, stamp)
         self._prev_target = target
         return TrackerFrame(stamp=stamp, drones=drones, target=target)
+
+    @staticmethod
+    def _parse_bounds(msg: Dict[str, Any], stamp: float) -> Optional[TrackerBounds]:
+        raw = msg.get("bounds")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            corners = np.asarray(raw["corners"], dtype=float).reshape(-1, 2)
+            camera = np.asarray(raw["camera"], dtype=float).reshape(3)
+        except Exception:
+            return None
+        if corners.shape[0] < 3:
+            return None
+        return TrackerBounds(corners=corners, camera=camera, stamp=stamp)
+
+    def get_bounds(self, timeout_s: float = 0.0) -> Optional[TrackerBounds]:
+        """最新の視野 bounds を返す。未受信なら timeout_s まで待ち、なければ None。
+
+        bounds は毎フレーム同梱とは限らないため、一度受信した値を保持し続ける
+        (四隅マーカは静止物なので古さは問題にならない)。
+        """
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while True:
+            with self._lock:
+                b = self._latest_bounds
+            if b is not None or time.time() >= deadline:
+                return b
+            time.sleep(0.02)
 
     def get_latest(self, timeout_s: Optional[float] = None) -> TrackerFrame:
         """Return the latest fresh frame.

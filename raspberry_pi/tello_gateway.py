@@ -167,9 +167,10 @@ class TelloGateway:
             # attitude? などを使うなら必要に応じて広げる
             return r not in ("ok", "error")
 
-        # 通常コマンド
+        # 通常コマンド。実機は 'error Not joystick' / 'error No valid imu' /
+        # 'error Motor stop' など複数語のエラー文字列を返すことがあるので前方一致。
         if c in ("command", "takeoff", "land", "stop"):
-            return r in ("ok", "error")
+            return r == "ok" or r.startswith("error") or r.startswith("unknown")
 
         # emergency は返信待ちしない想定
         if c == "emergency":
@@ -180,14 +181,30 @@ class TelloGateway:
             return True
 
         # その他 primitive command
-        return r in ("ok", "error")
+        return r == "ok" or r.startswith("error") or r.startswith("unknown")
 
 
-    def send_tello(self, cmd: str, wait_response: bool = False, timeout_s: float = 1.0) -> str:
+    def send_tello(self, cmd: str, wait_response: bool = False, timeout_s: float = 1.0,
+                   try_lock: bool = False) -> Optional[str]:
+        """Tello へ SDK コマンドを 1 つ送る。
+
+        戻り値: マッチした返信文字列 (返信なし/待たない場合は "")。
+        ``try_lock=True`` のときは、別スレッドが takeoff/land 等の長い同期待ちで
+        送信ロックを保持している間はブロックせず即座に ``None`` を返す
+        (watchdog と rc ストリームが長時間待たされて誤動作しないため)。
+        """
         if self._cmd_sock is None:
             raise RuntimeError("UDP command socket is not open")
 
-        with self._send_lock:
+        c = cmd.strip().lower()
+        log_sync = wait_response and c != "battery?"  # keepalive の battery? はログしない
+
+        if try_lock:
+            if not self._send_lock.acquire(blocking=False):
+                return None
+        else:
+            self._send_lock.acquire()
+        try:
             # 同期コマンドでは、送信前に古い返信を捨てる
             if wait_response:
                 self._clear_response_queue()
@@ -208,6 +225,8 @@ class TelloGateway:
                 # link DOWN and keep retrying, and recover automatically once the
                 # Tello becomes reachable.
                 self._last_send_time = send_time
+                if log_sync:
+                    self._log(f"cmd {cmd!r} -> send failed ({exc}); wlan0 down?", err=True)
                 return ""
             self._last_send_time = send_time
 
@@ -216,6 +235,7 @@ class TelloGateway:
 
             deadline = send_time + timeout_s
             last_unmatched = ""
+            result = ""
 
             while time.time() < deadline:
                 try:
@@ -231,19 +251,33 @@ class TelloGateway:
 
                 # 今のコマンドに対して妥当な返信だけ採用
                 if self._response_matches(cmd, text):
-                    return text
+                    result = text
+                    break
 
                 # デバッグ用に最後の不一致返信だけ保持
                 last_unmatched = text
 
-            # タイムアウト。取り違え防止のため、怪しい返信は返さない。
-            if last_unmatched:
-                print(
-                    f"[gateway] ignored unmatched response for cmd={cmd!r}: {last_unmatched!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return ""
+            if result:
+                if log_sync:
+                    self._log(f"cmd {cmd!r} -> {result!r} ({time.time() - send_time:.2f}s)")
+            else:
+                # タイムアウト。取り違え防止のため、怪しい返信は返さない。
+                if last_unmatched:
+                    self._log(f"ignored unmatched response for cmd={cmd!r}: {last_unmatched!r}",
+                              err=True)
+                if log_sync:
+                    self._log(f"cmd {cmd!r} -> NO RESPONSE ({timeout_s:.1f}s timeout)", err=True)
+            return result
+        finally:
+            # takeoff の arming/rc 鮮度更新はロック解放前に行う。解放後に行うと、
+            # 待機していた watchdog が古い last_rc_time を根拠に land を割り込ませ、
+            # 離陸直後の機体を着陸させてしまう競合窓ができる。
+            if c == "takeoff":
+                with self._state_lock:
+                    self.state.armed = True
+                    self.state.watchdog_landed = False
+                    self.state.last_rc_time = time.time()
+            self._send_lock.release()
     
     def _recv_tello_responses(self) -> None:
         assert self._cmd_sock is not None
@@ -312,14 +346,16 @@ class TelloGateway:
             if armed and last_rc > 0.0:
                 age = now - last_rc
                 if age > self.land_timeout and not already_landed:
-                    try:
-                        self.send_tello("land", wait_response=False)
-                    finally:
+                    # try_lock: takeoff/land の同期待ちがロックを保持している間は
+                    # 送らずスキップし、次の tick で新しい last_rc_time を見て
+                    # 再判定する (再離陸直後に古い判定で land しないため)。
+                    sent = self.send_tello("land", wait_response=False, try_lock=True)
+                    if sent is not None:
                         with self._state_lock:
                             self.state.watchdog_landed = True
                             self.state.armed = False
                 elif age > self.hover_timeout:
-                    self.send_tello("rc 0 0 0 0", wait_response=False)
+                    self.send_tello("rc 0 0 0 0", wait_response=False, try_lock=True)
             time.sleep(0.05)
 
     # ------------------------------------------------------------------
@@ -454,13 +490,11 @@ class TelloGateway:
             return {"ok": ok, "t": time.time(), "resp": resp}
 
         if typ == "takeoff":
-            resp = self.send_tello("takeoff", wait_response=True, timeout_s=8.0)
-            ok = resp.strip().lower() == "ok"
-
-            with self._state_lock:
-                self.state.armed = True
-                self.state.watchdog_landed = False
-                self.state.last_rc_time = time.time()
+            # Tello は離陸動作の完了後に 'ok' を返すため、応答まで 10 秒近く
+            # かかることがある。arming と last_rc_time の更新は send_tello 内
+            # (送信ロック解放前) で行われる。
+            resp = self.send_tello("takeoff", wait_response=True, timeout_s=12.0)
+            ok = (resp or "").strip().lower() == "ok"
 
             return {
                 "ok": ok,
@@ -499,11 +533,15 @@ class TelloGateway:
             rc_limit = int(msg.get("rc_limit", self.rc_default_limit))
             vals = self._action_to_rc(a, rc_limit)
             cmd = f"rc {vals[0]} {vals[1]} {vals[2]} {vals[3]}"
-            self.send_tello(cmd, wait_response=False)
+            # try_lock: 別スレッドの takeoff/land 同期待ち中は rc を 1 発捨てる
+            # (10Hz ストリームなので欠落は無害。ブロックすると PC 側の制御
+            # ループ全体が最大 12 秒止まり、他機の watchdog 着陸を誘発する)。
+            sent = self.send_tello(cmd, wait_response=False, try_lock=True)
             with self._state_lock:
+                # PC が生きている証拠なので、Tello へ届かなくても鮮度は更新する
                 self.state.last_rc_time = time.time()
                 self.state.watchdog_landed = False
-            return self._ok(cmd=cmd, rc=vals)
+            return self._ok(cmd=cmd, rc=vals, dropped=(sent is None))
 
         if typ == "status":
             with self._state_lock:

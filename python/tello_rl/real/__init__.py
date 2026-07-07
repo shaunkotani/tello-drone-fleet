@@ -1,7 +1,9 @@
 """Real Tello execution support via Raspberry Pi gateways."""
 
 from .pi_client import PiTelloClient, PiTelloGroup
-from .real_tracker import UdpJsonTracker, TrackerTimeout, RealDroneState, RealTargetState
+from .real_tracker import (
+    UdpJsonTracker, TrackerTimeout, RealDroneState, RealTargetState, TrackerBounds,
+)
 from .real_safety_shield import RealSafetyShield, RealSafetyConfig
 from .real_tello_env import RealTelloEnv
 from .aruco_tracker import (
@@ -20,6 +22,7 @@ __all__ = [
     "TrackerTimeout",
     "RealDroneState",
     "RealTargetState",
+    "TrackerBounds",
     "RealSafetyShield",
     "RealSafetyConfig",
     "RealTelloEnv",

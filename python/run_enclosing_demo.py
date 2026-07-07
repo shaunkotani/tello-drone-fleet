@@ -46,7 +46,7 @@ import numpy as np
 from tello_rl.config import EnvConfig
 from tello_rl import formation as fm
 from tello_rl.real import (
-    PiTelloGroup, UdpJsonTracker, TrackerTimeout,
+    PiTelloGroup, UdpJsonTracker, TrackerTimeout, TrackerBounds,
     RealSafetyShield, RealSafetyConfig,
 )
 
@@ -101,6 +101,94 @@ def enclosing_actions(states, center: np.ndarray, slots: np.ndarray, cfg: EnvCon
         a[3] = float(np.clip(kp_yaw * wrap_pi(yaw_ref - st.psi), -yaw_limit, yaw_limit))
         raw[i] = np.clip(a, -1.0, 1.0)
     return raw
+
+
+def fov_box_at_height(bounds: TrackerBounds, h: float) -> Tuple[float, float, float, float]:
+    """床の視野四隅とカメラ位置から、高度 h での視野内接矩形を返す。
+
+    カメラ視野は錐台なので、高度 h の断面は床の四隅をカメラ直下点へ
+    (Hc - h)/Hc 倍に相似縮小したもの。その内接軸平行矩形 (各軸の中央 2 値)
+    を保守的な飛行可能域として返す。return (x_min, x_max, y_min, y_max)。
+    """
+    cam = np.asarray(bounds.camera, dtype=float)
+    hc = float(cam[2])
+    if hc <= h + 0.05:
+        raise ValueError(f"カメラ高 {hc:.2f}m が飛行高度 {h:.2f}m 以下です (外部パラメータを確認)")
+    k = (hc - h) / hc
+    pts = cam[:2] + (np.asarray(bounds.corners, dtype=float) - cam[:2]) * k
+    xs = np.sort(pts[:, 0])
+    ys = np.sort(pts[:, 1])
+    return float(xs[1]), float(xs[-2]), float(ys[1]), float(ys[-2])
+
+
+def plan_formation_fit(cfg: EnvConfig, scfg: RealSafetyConfig,
+                       center: np.ndarray) -> Tuple[float, float]:
+    """安全ボックスに収まる最大半径 R_max と最適スロット位相を返す。
+
+    スロットは center + R*u(a_k), a_k = phase + 2πk/N。全スロットが壁 warn
+    マージンの内側に入る最大 R を、位相を振って最大化する (周期 2π/N)。
+    center がマージン内側にない場合は (0, 0) を返す。
+    """
+    m = scfg.d_wall_warn
+    lo = np.array([cfg.x_min + m, cfg.y_min + m])
+    hi = np.array([cfg.x_max - m, cfg.y_max - m])
+    c = np.asarray(center, dtype=float)
+    if np.any(c <= lo) or np.any(c >= hi):
+        return 0.0, 0.0
+    best_r, best_phase = 0.0, 0.0
+    for phase in np.linspace(0.0, 2.0 * math.pi / cfg.N, 91):
+        r_phase = float("inf")
+        for k in range(cfg.N):
+            a = phase + 2.0 * math.pi * k / cfg.N
+            u = (math.cos(a), math.sin(a))
+            for d in range(2):
+                if u[d] > 1e-9:
+                    r_phase = min(r_phase, (hi[d] - c[d]) / u[d])
+                elif u[d] < -1e-9:
+                    r_phase = min(r_phase, (lo[d] - c[d]) / u[d])
+        if r_phase > best_r:
+            best_r, best_phase = r_phase, float(phase)
+    return best_r, best_phase
+
+
+def formation_r_min(cfg: EnvConfig, scfg: RealSafetyConfig,
+                    spacing_margin: float = 0.10, target_margin: float = 0.10
+                    ) -> Tuple[float, float, float]:
+    """シールドと恒久的に干渉しない最小の取り囲み半径とその内訳。
+
+    機体間隔 2R sin(π/N) が d_drone_warn を余裕をもって上回り、かつスロットが
+    d_target_stop の外側にあること。return (r_min, r_spacing, r_target)。
+    """
+    r_spacing = (scfg.d_drone_warn + spacing_margin) / (2.0 * math.sin(math.pi / cfg.N))
+    r_target = scfg.d_target_stop + target_margin
+    return max(r_spacing, r_target), r_spacing, r_target
+
+
+def assign_slots(r: np.ndarray, slots: np.ndarray,
+                 center: Optional[np.ndarray] = None) -> List[int]:
+    """中心周りの角度順序を保存する巡回割当を返す。
+
+    perm[i] = 機体 i が向かうスロットの添字。機体を中心周りの角度で並べ、
+    スロットも角度で並べて、N 通りの巡回シフトのうち総距離最小を選ぶ。
+    順序が保存されるため各機は自分の角度セクター内を動くだけでよく、
+    「2 機の間 (スロット間隔 < 2*d_drone_stop) をすり抜ける」不可能な経路や
+    交差経路が発生しない。単純な最近傍割当だと、遠い側のスロットを引いた
+    機体が他機の間を通れず詰む (シールドが正しく通さない) ことがある。
+    """
+    N = len(slots)
+    c = np.mean(slots, axis=0) if center is None else np.asarray(center, dtype=float)
+    order_d = sorted(range(N), key=lambda i: math.atan2(r[i][1] - c[1], r[i][0] - c[0]))
+    order_s = sorted(range(N), key=lambda k: math.atan2(slots[k][1] - c[1], slots[k][0] - c[0]))
+    best: List[int] = list(range(N))
+    best_cost = float("inf")
+    for shift in range(N):
+        perm = [0] * N
+        for pos in range(N):
+            perm[order_d[pos]] = order_s[(pos + shift) % N]
+        cost = sum(float(np.linalg.norm(r[i] - slots[perm[i]])) for i in range(N))
+        if cost < best_cost:
+            best, best_cost = perm, cost
+    return best
 
 
 def enclosing_metrics(states, center: np.ndarray, slots: np.ndarray,
@@ -184,6 +272,44 @@ def parallel(group: PiTelloGroup, fn: Callable[[Any], Any], long_timeout_s: floa
     return errs
 
 
+def parallel_takeoff(group: PiTelloGroup, long_timeout_s: float, restore_timeout_s: float,
+                     hover_period_s: float = 0.4) -> List[Tuple[str, Optional[str]]]:
+    """takeoff を全機ほぼ同時に実行し、完了機には残りを待つ間 hover を送り続ける。
+
+    ゲートウェイは takeoff 完了時点で rc watchdog が武装される。全機の応答が
+    揃うのを待つだけだと、遅い機体のタイムアウト (最大 long_timeout_s) を待つ間に
+    先に離陸した機体への rc が途絶え、watchdog (land-timeout 1.5s) に着陸させ
+    られてしまう。そこで応答が返った機体から順に hover keep-alive を送る。
+    """
+    group.set_timeout(long_timeout_s)
+    errs: List[Tuple[str, Optional[str]]] = []
+    done_clients: List[Any] = []
+    try:
+        with ThreadPoolExecutor(max_workers=len(group.clients)) as ex:
+            pending = {ex.submit(c.takeoff): c for c in group.clients}
+            while pending:
+                for fut in [f for f in pending if f.done()]:
+                    c = pending.pop(fut)
+                    try:
+                        fut.result()
+                        errs.append((c.name, None))
+                    except Exception as exc:  # noqa: BLE001 - report per-drone
+                        errs.append((c.name, str(exc)))
+                    done_clients.append(c)
+                if not pending:
+                    break
+                for c in done_clients:
+                    try:
+                        c.hover()
+                    except Exception:
+                        pass
+                time.sleep(hover_period_s)
+    finally:
+        group.set_timeout(restore_timeout_s)
+    errs.sort(key=lambda x: x[0])
+    return errs
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="3-Tello cooperative enclosing demo (ArUco closed loop)")
     p.add_argument("--config", required=True, help="PC-side JSON config (pi_hosts/tracker/env)")
@@ -193,8 +319,11 @@ def main() -> int:
     p.add_argument("--no-land", action="store_true", help="終了時に自動着陸しない")
     p.add_argument("--duration", type=float, default=30.0, help="取り囲み制御の最大時間[s]")
     p.add_argument("--settle", type=float, default=6.0, help="takeoff 後の整定待ち[s]")
-    p.add_argument("--motion-timeout", type=float, default=12.0,
-                   help="takeoff/land 応答待ちのタイムアウト[s] (離着陸は数秒かかる)")
+    p.add_argument("--motion-timeout", type=float, default=15.0,
+                   help="takeoff/land 応答待ちのタイムアウト[s] "
+                        "(ゲートウェイ内部の takeoff 待ちは 12s なので余裕を持たせる)")
+    p.add_argument("--takeoff-retries", type=int, default=1,
+                   help="高度が上がらない機体への takeoff 再送回数 (0 で無効)")
     p.add_argument("--airborne-h", type=float, default=0.30,
                    help="離陸成功とみなす高度[m] (ArUco計測で確認)")
     p.add_argument("--airborne-delta", type=float, default=0.25,
@@ -212,6 +341,13 @@ def main() -> int:
                    help="機体間の停止距離[m] (既定0.45)。下げると近づけるが衝突リスク増")
     p.add_argument("--d-drone-warn", type=float, default=None,
                    help="機体間の減衰開始距離[m] (既定0.60)。d-drone-stop 以上にすること")
+    p.add_argument("--d-target-stop", type=float, default=None,
+                   help="対象物への停止距離[m] (既定0.30)。床マーカを囲むだけなら "
+                        "0.15 程度まで下げられる (R_min を支配しがち)")
+    p.add_argument("--wall-stop", type=float, default=None,
+                   help="視野/壁端の押し戻しマージン[m] (FOV自動フィット時の既定 0.15)")
+    p.add_argument("--wall-warn", type=float, default=None,
+                   help="視野/壁端の減衰マージン[m] (FOV自動フィット時の既定 0.30)")
     p.add_argument("--log", default="runs/enclosing_demo.csv")
     p.add_argument("--N", type=int, default=None)
     p.add_argument("--R", type=float, default=None)
@@ -244,9 +380,14 @@ def main() -> int:
         scfg.d_drone_stop = args.d_drone_stop
     if args.d_drone_warn is not None:
         scfg.d_drone_warn = args.d_drone_warn
+    if args.d_target_stop is not None:
+        scfg.d_target_stop = args.d_target_stop
     if scfg.d_drone_warn < scfg.d_drone_stop:
         print(f"[warn] d_drone_warn({scfg.d_drone_warn}) < d_drone_stop({scfg.d_drone_stop}); "
               f"警告帯が無効です", file=sys.stderr)
+    if scfg.d_drone_stop < 0.25:
+        print(f"[warn] d_drone_stop={scfg.d_drone_stop}m は Tello の機体サイズ (~0.2m) と"
+              f"ダウンウォッシュを考えると危険です。0.30m 以上を強く推奨", file=sys.stderr)
     shield = RealSafetyShield(cfg, scfg)
     control_timeout = float(cfg_json.get("pi_timeout_s", 1.0))  # 制御ループ用の短いタイムアウト
 
@@ -279,6 +420,68 @@ def main() -> int:
                   file=sys.stderr)
             return 2
 
+        # --- カメラ視野の自動フィット (四隅マーカ + カメラ姿勢による錐台補正) ---
+        bounds = tracker.get_bounds(timeout_s=1.0)
+        # シールドは h_min_real + h_warn_margin 未満への降下を止めるため、
+        # 実飛行高度はこの下限を下回らない。FOV も実飛行高度で計算する。
+        h_floor = scfg.h_min_real + scfg.h_warn_margin
+        h_fit = max(cfg.h_ref, h_floor)
+        if cfg.h_ref < h_floor:
+            print(f"[warn] h_ref={cfg.h_ref}m はシールドの高度下限 {h_floor:.2f}m 未満です。"
+                  f"実飛行高度は ~{h_floor:.2f}m になり、FOV 計算にも {h_fit:.2f}m を使います",
+                  file=sys.stderr)
+        if bounds is not None:
+            cam = bounds.camera
+            box = fov_box_at_height(bounds, h_fit)  # ValueError は外側で捕捉
+            if box[0] >= box[1] or box[2] >= box[3]:
+                print(f"[error] 四隅マーカから有効な視野矩形を作れません: {np.round(box, 2)}",
+                      file=sys.stderr)
+                return 2
+            cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max = box
+            # 視野端は物理壁ではない (越えてもマーカ喪失 -> 自動着陸) のでマージンは緩め
+            scfg.d_wall_stop = 0.15 if args.wall_stop is None else args.wall_stop
+            scfg.d_wall_warn = 0.30 if args.wall_warn is None else args.wall_warn
+            print(f"FOV 自動フィット: カメラ ({cam[0]:+.2f},{cam[1]:+.2f}) 高さ {cam[2]:.2f}m, "
+                  f"h={h_fit:.2f}m での視野 x=[{cfg.x_min:.2f},{cfg.x_max:.2f}] "
+                  f"y=[{cfg.y_min:.2f},{cfg.y_max:.2f}]")
+        else:
+            if args.wall_stop is not None:
+                scfg.d_wall_stop = args.wall_stop
+            if args.wall_warn is not None:
+                scfg.d_wall_warn = args.wall_warn
+            print(f"[warn] トラッカに四隅 bounds なし (config の ids.corners 未設定?)。"
+                  f"config の範囲を使用: x=[{cfg.x_min},{cfg.x_max}] y=[{cfg.y_min},{cfg.y_max}]",
+                  file=sys.stderr)
+
+        # --- 取り囲み計画: 実行可否判定と R / スロット位相の自動調整 ---
+        plan_center = (np.asarray(args.center, dtype=float) if args.center is not None
+                       else target.r.copy())
+        r_max, phase = plan_formation_fit(cfg, scfg, plan_center)
+        r_min, r_min_sp, r_min_tg = formation_r_min(cfg, scfg)
+        if r_max < r_min:
+            cx = 0.5 * (cfg.x_min + cfg.x_max)
+            cy = 0.5 * (cfg.y_min + cfg.y_max)
+            dominant = (f"機体間隔 (--d-drone-warn={scfg.d_drone_warn}) が支配的"
+                        if r_min_sp >= r_min_tg else
+                        f"対象物距離 (--d-target-stop={scfg.d_target_stop}) が支配的")
+            print(f"[error] この空間では N={cfg.N} の取り囲みが成立しません: "
+                  f"R_max={r_max:.2f}m < R_min={r_min:.2f}m\n"
+                  f"  R_min の内訳: 機体間隔 {r_min_sp:.2f}m / 対象物距離 {r_min_tg:.2f}m -> {dominant}\n"
+                  f"  対処: 支配的な方のマージンを下げる / --wall-warn を下げる /\n"
+                  f"        h_ref を下げる (視野が広がる) / "
+                  f"対象物を視野中心 ({cx:+.2f},{cy:+.2f}) 付近へ移動する", file=sys.stderr)
+            return 2
+        r_req = cfg.R
+        cfg.R = float(min(max(cfg.R, r_min), r_max))
+        if abs(cfg.R - r_req) > 1e-6:
+            print(f"[warn] R={r_req}m を実行可能範囲 [{r_min:.2f}, {r_max:.2f}] に合わせて "
+                  f"{cfg.R:.2f}m に調整しました")
+        phi = phase - getattr(cfg, "alpha0", 0.0)
+        spacing = 2.0 * cfg.R * math.sin(math.pi / cfg.N)
+        print(f"取り囲み計画: R={cfg.R:.2f}m (可行域 [{r_min:.2f}, {r_max:.2f}]), "
+              f"位相={math.degrees(phase):.0f}deg, 機体間={spacing:.2f}m, "
+              f"中心=({plan_center[0]:+.2f},{plan_center[1]:+.2f})")
+
         # --- バッテリ確認 ---
         print("バッテリ確認:")
         if not battery_check(group, args.min_battery) and not args.yes:
@@ -286,7 +489,7 @@ def main() -> int:
 
         # --- 離陸 ---
         if args.takeoff:
-            confirm(args, f"{cfg.N} 台を離陸させ、目標点の周囲 R={cfg.R}m に取り囲みます。\n"
+            confirm(args, f"{cfg.N} 台を離陸させ、目標点の周囲 R={cfg.R:.2f}m に取り囲みます。\n"
                           f"周囲の安全を確認してください。")
             # 離陸前の高度を記録 (上昇量の判定に使う)
             h0 = {i: 0.0 for i in range(cfg.N)}
@@ -297,8 +500,8 @@ def main() -> int:
                 pass
 
             print("takeoff (並列)...")
-            errs = parallel(group, lambda c: c.takeoff(),
-                            long_timeout_s=args.motion_timeout, restore_timeout_s=control_timeout)
+            errs = parallel_takeoff(group, long_timeout_s=args.motion_timeout,
+                                    restore_timeout_s=control_timeout)
             for n, e in errs:
                 if e:
                     # ok パケットは落ちやすい。応答未確認でも高度で判定する。
@@ -306,30 +509,89 @@ def main() -> int:
 
             # 離陸確認 + 整定を 1 ループで。ゲートウェイの watchdog(1.5s無rcで着陸)を
             # 避けるため、高度保持 rc を送り続けながら全機の上昇を確認する。
+            # 高度が上がらない機体には takeoff を再送する (コマンドの UDP ロス対策)。
             print(f"離陸確認+整定 (高度>={args.airborne_h}m または +{args.airborne_delta}m を確認)...")
             airborne: set = set()
+            retry_futs: Dict[int, Any] = {}      # index -> in-flight takeoff future
+            retries_left = {i: max(0, args.takeoff_retries) for i in range(cfg.N)}
+            retry_grace_s = 3.0  # 応答ロストでも実際は上昇中、という機体を待つ猶予
+            retry_ex = ThreadPoolExecutor(max_workers=cfg.N)
+
+            def _retry_takeoff(c):
+                # 再送中はこのクライアントのソケットを再送スレッドが専有する
+                # (メインループは rc 送信をスキップする)
+                c.set_timeout(args.motion_timeout)
+                try:
+                    return c.takeoff()
+                finally:
+                    c.set_timeout(control_timeout)
+
+            def _collect_retries() -> None:
+                for i, fut in list(retry_futs.items()):
+                    if fut.done():
+                        retry_futs.pop(i)
+                        name = group.clients[i].name
+                        try:
+                            fut.result()
+                            print(f"[info] {name}: takeoff 再送に応答 ok")
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"[warn] {name}: takeoff 再送も応答未確認 ({exc}); "
+                                  f"高度で確認を継続")
+
+            def _hover_except_retrying() -> None:
+                for i, c in enumerate(group.clients):
+                    if i not in retry_futs:
+                        try:
+                            c.hover()
+                        except Exception:
+                            pass
+
             t_s = time.time()
             deadline = t_s + max(args.motion_timeout, args.settle + 2.0)
             verified = False
-            while time.time() < deadline and not _stop:
-                try:
-                    states, _, _ = tracker.get_states(timeout_s=0.5)
-                except TrackerTimeout:
-                    group.hover_all()  # keep-alive
+            try:
+                while time.time() < deadline and not _stop:
+                    _collect_retries()
+                    try:
+                        states, _, _ = tracker.get_states(timeout_s=0.5)
+                    except TrackerTimeout:
+                        _hover_except_retrying()  # keep-alive
+                        time.sleep(dt)
+                        continue
+                    raw = np.zeros((cfg.N, 4))
+                    for i, st in enumerate(states):
+                        raw[i, 2] = float(np.clip(args.kp_h * (cfg.h_ref - st.h),
+                                                  -args.ud_limit, args.ud_limit))
+                        if st.h >= args.airborne_h or (st.h - h0.get(i, 0.0)) >= args.airborne_delta:
+                            airborne.add(i)
+                    # 高度が上がらない機体へ takeoff を再送
+                    if (time.time() - t_s) >= retry_grace_s:
+                        for i in range(cfg.N):
+                            if i in airborne or i in retry_futs or retries_left[i] <= 0:
+                                continue
+                            retries_left[i] -= 1
+                            print(f"[warn] {group.clients[i].name}: 高度が上がらないため "
+                                  f"takeoff を再送します")
+                            retry_futs[i] = retry_ex.submit(_retry_takeoff, group.clients[i])
+                            deadline = max(deadline,
+                                           time.time() + args.motion_timeout + args.settle)
+                    res = shield.filter(raw, states, tracker_age_s=None)
+                    for i, c in enumerate(group.clients):
+                        if i not in retry_futs:  # 再送中の機体はソケット使用中なのでスキップ
+                            c.rc(res.actions[i], rc_limit=rc_limit)
+                    if len(airborne) == cfg.N and not retry_futs \
+                            and (time.time() - t_s) >= args.settle:
+                        verified = True
+                        break
                     time.sleep(dt)
-                    continue
-                raw = np.zeros((cfg.N, 4))
-                for i, st in enumerate(states):
-                    raw[i, 2] = float(np.clip(args.kp_h * (cfg.h_ref - st.h),
-                                              -args.ud_limit, args.ud_limit))
-                    if st.h >= args.airborne_h or (st.h - h0.get(i, 0.0)) >= args.airborne_delta:
-                        airborne.add(i)
-                res = shield.filter(raw, states, tracker_age_s=None)
-                group.send_actions(res.actions, rc_limit=rc_limit)
-                if len(airborne) == cfg.N and (time.time() - t_s) >= args.settle:
-                    verified = True
-                    break
-                time.sleep(dt)
+            finally:
+                # 再送スレッドが残ったまま先へ進むと land と同一ソケットを共有して
+                # しまうため、他機に hover を送りつつ完了を待つ
+                while retry_futs:
+                    _collect_retries()
+                    _hover_except_retrying()
+                    time.sleep(dt)
+                retry_ex.shutdown(wait=False)
 
             not_air = [i for i in range(cfg.N) if i not in airborne]
             if not_air:
@@ -345,6 +607,7 @@ def main() -> int:
         k = 0
         last_print = 0.0
         consecutive_hard = 0
+        slot_perm: Optional[List[int]] = None  # 初回に最近傍割当を決めて固定
         while not _stop and (time.time() - t0) < args.duration:
             try:
                 states, target, battery = tracker.get_states(timeout_s=2.0 * cfg.dt)
@@ -358,6 +621,11 @@ def main() -> int:
             center = np.asarray(args.center, dtype=float) if args.center is not None else target.r
             phi = fm.update_heading(phi, vo, cfg)              # 静止なので phi 据え置き
             slots, _ = fm.compute_slots(center, vo, phi, cfg)  # 式(44)
+            if slot_perm is None:
+                slot_perm = assign_slots(np.stack([s.r for s in states]), slots, center)
+                if slot_perm != list(range(cfg.N)):
+                    print(f"slot assignment: drone i -> slot {slot_perm} (角度順序保存割当)")
+            slots = slots[slot_perm]
             edge_ref = fm.edge_ref_lengths(slots)
 
             raw = enclosing_actions(states, center, slots, cfg, args.kp_xy, args.kp_h,
