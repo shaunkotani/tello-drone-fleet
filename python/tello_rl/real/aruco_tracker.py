@@ -47,39 +47,79 @@ except ImportError as exc:  # pragma: no cover - import guard
 # --------------------------------------------------------------------------- #
 @dataclass
 class CameraIntrinsics:
-    """カメラ行列 K (3x3) と歪み係数 dist。``calibrate_camera.py`` で生成。"""
+    """カメラ行列 K (3x3) と歪み係数 dist。``calibrate_camera.py`` で生成。
+
+    ``image_size`` は校正時の画像サイズ (width, height)。K は解像度に比例するため、
+    実行時のフレームサイズが異なるときは ``matched_to`` でスケーリングして使う
+    (ずれたまま使うと位置・高度が比例して狂い、RMS には現れない)。
+    旧形式ファイルには無いので Optional。
+    """
 
     K: np.ndarray
     dist: np.ndarray
+    image_size: Optional[Tuple[int, int]] = None
 
     @staticmethod
     def load(path: str | os.PathLike[str]) -> "CameraIntrinsics":
         path = str(path)
+        size = None
         if path.endswith(".npz"):
             data = np.load(path)
             K = np.asarray(data["camera_matrix"], dtype=np.float64)
             dist = np.asarray(data["dist_coeffs"], dtype=np.float64)
+            if "image_size" in data:
+                size = data["image_size"]
         elif path.endswith(".json"):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             K = np.asarray(data["camera_matrix"], dtype=np.float64).reshape(3, 3)
             dist = np.asarray(data["dist_coeffs"], dtype=np.float64).reshape(1, -1)
+            size = data.get("image_size")
         else:
             raise ValueError(f"unsupported calibration format: {path} (use .npz or .json)")
-        return CameraIntrinsics(K=K.reshape(3, 3), dist=dist.reshape(1, -1))
+        image_size = None if size is None else (int(size[0]), int(size[1]))
+        return CameraIntrinsics(K=K.reshape(3, 3), dist=dist.reshape(1, -1),
+                                image_size=image_size)
 
     def save(self, path: str | os.PathLike[str]) -> None:
         path = str(path)
         if path.endswith(".npz"):
-            np.savez(path, camera_matrix=self.K, dist_coeffs=self.dist)
+            extra = {}
+            if self.image_size is not None:
+                extra["image_size"] = np.asarray(self.image_size, dtype=np.int64)
+            np.savez(path, camera_matrix=self.K, dist_coeffs=self.dist, **extra)
         elif path.endswith(".json"):
+            payload = {"camera_matrix": self.K.tolist(),
+                       "dist_coeffs": self.dist.ravel().tolist()}
+            if self.image_size is not None:
+                payload["image_size"] = [int(self.image_size[0]), int(self.image_size[1])]
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"camera_matrix": self.K.tolist(), "dist_coeffs": self.dist.ravel().tolist()},
-                    f, indent=2,
-                )
+                json.dump(payload, f, indent=2)
         else:
             raise ValueError(f"unsupported calibration format: {path}")
+
+    def matched_to(self, width: int, height: int) -> "CameraIntrinsics":
+        """実行フレームサイズに合わせた内部パラメータを返す。
+
+        校正解像度と一致すれば self をそのまま返す。異なる場合は fx/cx を横比、
+        fy/cy を縦比でスケーリングした複製を返す (歪み係数は正規化座標系なので
+        解像度に依存しない)。校正解像度が未記録 (旧形式) のときは検証できないため
+        そのまま返す。
+        """
+        if self.image_size is None:
+            return self
+        cw, ch = int(self.image_size[0]), int(self.image_size[1])
+        if (cw, ch) == (int(width), int(height)):
+            return self
+        sx = float(width) / cw
+        sy = float(height) / ch
+        K = self.K.copy()
+        K[0, 0] *= sx
+        K[0, 2] *= sx
+        K[1, 1] *= sy
+        K[1, 2] *= sy
+        return CameraIntrinsics(K=K, dist=self.dist.copy(),
+                                image_size=(int(width), int(height)))
 
 
 # --------------------------------------------------------------------------- #
@@ -89,8 +129,8 @@ class CameraIntrinsics:
 class ArucoTrackerConfig:
     # camera
     camera_index: int = 0
-    width: int = 1280
-    height: int = 720
+    width: int = 1920
+    height: int = 1080
     fps: float = 30.0
     calibration: str = "configs/camera_calib.npz"
 
@@ -137,8 +177,8 @@ class ArucoTrackerConfig:
         out = raw.get("output", {})
         return ArucoTrackerConfig(
             camera_index=int(cam.get("index", 0)),
-            width=int(cam.get("width", 1280)),
-            height=int(cam.get("height", 720)),
+            width=int(cam.get("width", 1920)),
+            height=int(cam.get("height", 1080)),
             fps=float(cam.get("fps", 30.0)),
             calibration=str(cam.get("calibration", "configs/camera_calib.npz")),
             dictionary=str(ar.get("dictionary", "DICT_4X4_50")),

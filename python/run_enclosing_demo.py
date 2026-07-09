@@ -45,6 +45,9 @@ import numpy as np
 
 from tello_rl.config import EnvConfig
 from tello_rl import formation as fm
+from tello_rl.formation_ellipse import (
+    EllipseSpec, slots_ellipse, plan_ellipse_fit, min_edge_distance,
+)
 from tello_rl.real import (
     PiTelloGroup, UdpJsonTracker, TrackerTimeout, TrackerBounds,
     RealSafetyShield, RealSafetyConfig,
@@ -193,11 +196,16 @@ def assign_slots(r: np.ndarray, slots: np.ndarray,
 
 def enclosing_metrics(states, center: np.ndarray, slots: np.ndarray,
                       edge_ref: np.ndarray, cfg: EnvConfig) -> Dict[str, float]:
-    """取り囲み誤差 (式(133)-(135)) と安全指標を計算する。"""
+    """取り囲み誤差 (式(133)-(135)) と安全指標を計算する。
+
+    E_R の基準半径は各スロットの中心距離を使う。円 (全スロットが距離 R) では
+    従来の |dist - R| と同値で、楕円などスロット距離が不均一な隊形にも使える。
+    """
     r = np.stack([s.r for s in states])
     N = len(states)
     e_slot = float(np.mean([np.linalg.norm(r[i] - slots[i]) for i in range(N)]))
-    e_R = float(np.mean([abs(np.linalg.norm(r[i] - center) - cfg.R) for i in range(N)]))
+    e_R = float(np.mean([abs(np.linalg.norm(r[i] - center) - np.linalg.norm(slots[i] - center))
+                         for i in range(N)]))
     e_edge = float(np.mean([
         abs(np.linalg.norm(r[i] - r[(i + 1) % N]) - edge_ref[i]) for i in range(N)
     ]))
@@ -316,6 +324,11 @@ def main() -> int:
     p.add_argument("--center", type=float, nargs=2, default=None, metavar=("X", "Y"),
                    help="囲む固定点[m]。省略時は ArUco 対象物マーカを囲む")
     p.add_argument("--takeoff", action="store_true", help="制御前に全機 takeoff")
+    p.add_argument("--shape", choices=["circle", "ellipse"], default="circle",
+                   help="隊形: circle=正多角形 (円スロット, 現行のまま) / "
+                        "ellipse=楕円スロット (Ra,Rb,位相は自動計画され --R は無視)")
+    p.add_argument("--aspect", type=float, default=2.0,
+                   help="--shape ellipse の軸比 max(Ra,Rb)/min(Ra,Rb) の上限")
     p.add_argument("--no-land", action="store_true", help="終了時に自動着陸しない")
     p.add_argument("--duration", type=float, default=30.0, help="取り囲み制御の最大時間[s]")
     p.add_argument("--settle", type=float, default=6.0, help="takeoff 後の整定待ち[s]")
@@ -453,34 +466,55 @@ def main() -> int:
                   f"config の範囲を使用: x=[{cfg.x_min},{cfg.x_max}] y=[{cfg.y_min},{cfg.y_max}]",
                   file=sys.stderr)
 
-        # --- 取り囲み計画: 実行可否判定と R / スロット位相の自動調整 ---
+        # --- 取り囲み計画: 実行可否判定と隊形パラメータの自動調整 ---
         plan_center = (np.asarray(args.center, dtype=float) if args.center is not None
                        else target.r.copy())
-        r_max, phase = plan_formation_fit(cfg, scfg, plan_center)
-        r_min, r_min_sp, r_min_tg = formation_r_min(cfg, scfg)
-        if r_max < r_min:
-            cx = 0.5 * (cfg.x_min + cfg.x_max)
-            cy = 0.5 * (cfg.y_min + cfg.y_max)
-            dominant = (f"機体間隔 (--d-drone-warn={scfg.d_drone_warn}) が支配的"
-                        if r_min_sp >= r_min_tg else
-                        f"対象物距離 (--d-target-stop={scfg.d_target_stop}) が支配的")
-            print(f"[error] この空間では N={cfg.N} の取り囲みが成立しません: "
-                  f"R_max={r_max:.2f}m < R_min={r_min:.2f}m\n"
-                  f"  R_min の内訳: 機体間隔 {r_min_sp:.2f}m / 対象物距離 {r_min_tg:.2f}m -> {dominant}\n"
-                  f"  対処: 支配的な方のマージンを下げる / --wall-warn を下げる /\n"
-                  f"        h_ref を下げる (視野が広がる) / "
-                  f"対象物を視野中心 ({cx:+.2f},{cy:+.2f}) 付近へ移動する", file=sys.stderr)
-            return 2
-        r_req = cfg.R
-        cfg.R = float(min(max(cfg.R, r_min), r_max))
-        if abs(cfg.R - r_req) > 1e-6:
-            print(f"[warn] R={r_req}m を実行可能範囲 [{r_min:.2f}, {r_max:.2f}] に合わせて "
-                  f"{cfg.R:.2f}m に調整しました")
-        phi = phase - getattr(cfg, "alpha0", 0.0)
-        spacing = 2.0 * cfg.R * math.sin(math.pi / cfg.N)
-        print(f"取り囲み計画: R={cfg.R:.2f}m (可行域 [{r_min:.2f}, {r_max:.2f}]), "
-              f"位相={math.degrees(phase):.0f}deg, 機体間={spacing:.2f}m, "
-              f"中心=({plan_center[0]:+.2f},{plan_center[1]:+.2f})")
+        ellipse_spec: Optional[EllipseSpec] = None
+        if args.shape == "ellipse":
+            ellipse_spec = plan_ellipse_fit(cfg, scfg, plan_center, aspect_max=args.aspect)
+            if ellipse_spec is None:
+                cx = 0.5 * (cfg.x_min + cfg.x_max)
+                cy = 0.5 * (cfg.y_min + cfg.y_max)
+                print(f"[error] この空間では N={cfg.N} の楕円取り囲みが成立しません\n"
+                      f"  対処: --d-drone-warn, --d-target-stop, --wall-warn を下げる / "
+                      f"--aspect を上げる /\n"
+                      f"        対象物を視野中心 ({cx:+.2f},{cy:+.2f}) 付近へ移動する",
+                      file=sys.stderr)
+                return 2
+            slots0 = slots_ellipse(plan_center, ellipse_spec, cfg.N)
+            pair_d = [float(np.linalg.norm(slots0[i] - slots0[j]))
+                      for i in range(cfg.N) for j in range(i + 1, cfg.N)]
+            print(f"取り囲み計画 (楕円): Ra={ellipse_spec.R_a:.2f}m Rb={ellipse_spec.R_b:.2f}m "
+                  f"位相={math.degrees(ellipse_spec.phase):.0f}deg "
+                  f"機体間=[{min(pair_d):.2f}, {max(pair_d):.2f}]m "
+                  f"囲み頑健性={min_edge_distance(slots0, plan_center):.2f}m "
+                  f"中心=({plan_center[0]:+.2f},{plan_center[1]:+.2f})")
+        else:
+            r_max, phase = plan_formation_fit(cfg, scfg, plan_center)
+            r_min, r_min_sp, r_min_tg = formation_r_min(cfg, scfg)
+            if r_max < r_min:
+                cx = 0.5 * (cfg.x_min + cfg.x_max)
+                cy = 0.5 * (cfg.y_min + cfg.y_max)
+                dominant = (f"機体間隔 (--d-drone-warn={scfg.d_drone_warn}) が支配的"
+                            if r_min_sp >= r_min_tg else
+                            f"対象物距離 (--d-target-stop={scfg.d_target_stop}) が支配的")
+                print(f"[error] この空間では N={cfg.N} の取り囲みが成立しません: "
+                      f"R_max={r_max:.2f}m < R_min={r_min:.2f}m\n"
+                      f"  R_min の内訳: 機体間隔 {r_min_sp:.2f}m / 対象物距離 {r_min_tg:.2f}m -> {dominant}\n"
+                      f"  対処: 支配的な方のマージンを下げる / --wall-warn を下げる /\n"
+                      f"        h_ref を下げる (視野が広がる) / "
+                      f"対象物を視野中心 ({cx:+.2f},{cy:+.2f}) 付近へ移動する", file=sys.stderr)
+                return 2
+            r_req = cfg.R
+            cfg.R = float(min(max(cfg.R, r_min), r_max))
+            if abs(cfg.R - r_req) > 1e-6:
+                print(f"[warn] R={r_req}m を実行可能範囲 [{r_min:.2f}, {r_max:.2f}] に合わせて "
+                      f"{cfg.R:.2f}m に調整しました")
+            phi = phase - getattr(cfg, "alpha0", 0.0)
+            spacing = 2.0 * cfg.R * math.sin(math.pi / cfg.N)
+            print(f"取り囲み計画: R={cfg.R:.2f}m (可行域 [{r_min:.2f}, {r_max:.2f}]), "
+                  f"位相={math.degrees(phase):.0f}deg, 機体間={spacing:.2f}m, "
+                  f"中心=({plan_center[0]:+.2f},{plan_center[1]:+.2f})")
 
         # --- バッテリ確認 ---
         print("バッテリ確認:")
@@ -489,7 +523,9 @@ def main() -> int:
 
         # --- 離陸 ---
         if args.takeoff:
-            confirm(args, f"{cfg.N} 台を離陸させ、目標点の周囲 R={cfg.R:.2f}m に取り囲みます。\n"
+            shape_desc = (f"R={cfg.R:.2f}m" if ellipse_spec is None
+                          else f"楕円 {ellipse_spec.R_a:.2f}×{ellipse_spec.R_b:.2f}m")
+            confirm(args, f"{cfg.N} 台を離陸させ、目標点の周囲 {shape_desc} に取り囲みます。\n"
                           f"周囲の安全を確認してください。")
             # 離陸前の高度を記録 (上昇量の判定に使う)
             h0 = {i: 0.0 for i in range(cfg.N)}
@@ -619,8 +655,11 @@ def main() -> int:
                 break
 
             center = np.asarray(args.center, dtype=float) if args.center is not None else target.r
-            phi = fm.update_heading(phi, vo, cfg)              # 静止なので phi 据え置き
-            slots, _ = fm.compute_slots(center, vo, phi, cfg)  # 式(44)
+            if ellipse_spec is not None:
+                slots = slots_ellipse(center, ellipse_spec, cfg.N)     # 楕円隊形
+            else:
+                phi = fm.update_heading(phi, vo, cfg)              # 静止なので phi 据え置き
+                slots, _ = fm.compute_slots(center, vo, phi, cfg)  # 式(44)
             if slot_perm is None:
                 slot_perm = assign_slots(np.stack([s.r for s in states]), slots, center)
                 if slot_perm != list(range(cfg.N)):

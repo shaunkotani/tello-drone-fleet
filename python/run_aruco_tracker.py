@@ -127,9 +127,35 @@ def main() -> int:
         )
         return 2
 
-    tracker = ArucoTracker(cfg, intr)
     publisher = UdpPublisher(cfg.out_host, cfg.out_port)
     cap = open_camera(cfg)
+
+    # 校正解像度と実フレームサイズの照合。K は解像度に比例するため、ずれたまま
+    # 使うと位置・高度が黙って比例して狂う (RMS には現れない)。
+    ok0 = False
+    for _ in range(50):
+        ok0, frame0 = cap.read()
+        if ok0:
+            break
+        time.sleep(0.05)
+    if ok0:
+        fh, fw = frame0.shape[:2]
+        if intr.image_size is None:
+            print(
+                f"[warn] calibration file has no image_size (old format); cannot verify "
+                f"it matches capture {fw}x{fh}. Re-save with: "
+                f"python calibrate_camera.py --analyze --out {cfg.calibration}",
+                file=sys.stderr,
+            )
+        elif tuple(intr.image_size) != (fw, fh):
+            print(
+                f"[warn] calibration resolution {intr.image_size[0]}x{intr.image_size[1]} "
+                f"!= capture {fw}x{fh}; scaling K to match",
+                file=sys.stderr,
+            )
+            intr = intr.matched_to(fw, fh)
+
+    tracker = ArucoTracker(cfg, intr)
 
     if cfg.viz:
         # Resizable window sized to fit the screen, independent of capture
